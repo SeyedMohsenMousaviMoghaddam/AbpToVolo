@@ -33,6 +33,13 @@ public static class Program
           --stub-unresolved          Errors the fixes cannot solve: keep the original body under #if ABPTOVOLO_ORIGINAL and
                                      throw NotImplementedException, so the solution builds (each one is listed in the report)
           --build                    Run 'dotnet build' on the result and add the remaining errors to the report
+          --id-type <type>           source (default): the application's user/role/organization unit references keep the
+                                     source key type (long/int), linked to the ABP.io entities through LegacyId;
+                                     guid: convert them to Guid. TenantId and the audit fields are Guid in both (ABP.io standard)
+          --connection-string <cs>   ConnectionStrings:Default of the converted host and DbMigrator (default: the source's;
+                                     or set ABPTOVOLO_CONNECTION_STRING). Not saved with --save-config.
+          --migrate-database         Run the converted DbMigrator on that database (CHANGES THE DATABASE: use a copy)
+          --verify-host              Start the converted host and check that Swagger answers, then stop it
           --force                    Replace the destination folder if it is not empty
           -v, --verbose              Show every change in the console (the log file always has everything)
           -h, --help                 Show this help
@@ -162,6 +169,15 @@ public static class Program
                 case "--build": settings.Build = true; break;
                 case "--no-compiler-fixes": settings.CompilerFixes = false; break;
                 case "--stub-unresolved": settings.StubUnresolved = true; break;
+                case "--connection-string": settings.ConnectionString = Value(); break;
+                case "--id-type":
+                    var idType = Value();
+                    settings.IdType = Enum.TryParse<IdTypeMode>(idType, ignoreCase: true, out var parsedIdType)
+                        ? parsedIdType
+                        : throw new ArgumentException($"Unknown id type '{idType}' (source, guid)");
+                    break;
+                case "--migrate-database": settings.MigrateDatabase = true; break;
+                case "--verify-host": settings.VerifyHost = true; break;
                 case "--force": settings.Force = true; break;
                 case "-v" or "--verbose": settings.Verbose = true; break;
                 case var a when a.StartsWith('-'): throw new ArgumentException($"Unknown option {a}");

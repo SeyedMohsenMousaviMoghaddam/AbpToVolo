@@ -32,6 +32,10 @@
 | `--migrations squash\|delete\|keep` | ادغام migrationها با حفظ تاریخچه (پیش‌فرض)، حذف، یا بدون تغییر |
 | `--no-compiler-fixes` | خروجی build و اصلاح خودکار نشود |
 | `--stub-unresolved` | خطاهایی که اصلاح خودکار ندارند: بدنه اصلی عضو زیر `#if ABPTOVOLO_ORIGINAL` نگه داشته می‌شود و `NotImplementedException` پرتاب می‌کند تا کل solution کامپایل شود (هر مورد در گزارش) |
+| `--id-type source\|guid` | نوع کلید ارجاع‌های خود برنامه به کاربر/نقش (`UserId`، `RoleId`…). `source` (پیش‌فرض) نوع مبدا (long/int) را نگه می‌دارد و از طریق `LegacyId` به Entityهای ABP.io وصل می‌شود؛ `guid` آن‌ها را به Guid تبدیل می‌کند. فیلدهای ماژول‌های ABP.io (`TenantId`، `CreatorId`…) در هر دو حالت Guid هستند |
+| `--connection-string <cs>` | `ConnectionStrings:Default` برای Host و DbMigrator تبدیل‌شده (یا متغیر محیطی `ABPTOVOLO_CONNECTION_STRING`؛ در تنظیمات ذخیره نمی‌شود) |
+| `--migrate-database` | بعد از تبدیل، DbMigrator را اجرا می‌کند (**دیتابیس را تغییر می‌دهد؛ روی کپی اجرا کنید**) |
+| `--verify-host` | Host تبدیل‌شده را اجرا می‌کند، بالا آمدن Swagger را بررسی می‌کند و آن را می‌بندد؛ نتیجه در گزارش می‌آید |
 | `--build`، `--force`، `--verbose` | build نهایی و درج خطاها در گزارش، جایگزینی خروجی، لاگ کامل |
 
 خروجی: solution تبدیل‌شده + `ABP-MIGRATION-REPORT.md` (چک‌لیست کارهای دستی با شماره خط) + `abp-migration-report.json` + `abp-migration.log` (لاگ کامل همه مراحل).
@@ -120,6 +124,21 @@ git merge converted           # فقط تعارض‌های واقعی می‌م�
      FKهای قدیمی حذف و Indexها دوباره ساخته می‌شوند. اگر شناسه‌ای نگاشت نداشته باشد، migration با پیام روشن متوقف می‌شود. snapshot هم به‌روز می‌شود، پس migration بعدی (`AbpIoModules`) فقط جداول ABP.io و FKهای جدید را اضافه می‌کند و ستون Audit را حذف/اضافه نمی‌کند.
   3. اسکریپت `ModuleZeroDataMigration.sql` کاربران، نقش‌ها، Tenantها، UserRoleها و مجوزها را با **همان Guidهای `Zero_IdMap`** به جداول ABP.io کپی می‌کند. Hash رمزها سازگار است (ASP.NET Core Identity).
 - در کد هم قاعده‌ی شناسه‌ها یکسان است (`ZeroMappings.GuidIdKind`): پراپرتی‌ها، پارامترها و متغیرهای `*UserId`/`*TenantId`/`*RoleId`/`*OrganizationUnitId` به `Guid` و رشته‌های `[ForeignKey("CreatorUserId")]`/`HasForeignKey("…")` به نام‌های ABP.io تبدیل می‌شوند. پس مدل EF و دیتابیس هم‌خوان می‌مانند.
+
+### نوع کلیدها (`--id-type`)
+
+ماژول‌های Identity و TenantManagement در ABP.io کلید Guid دارند. فیلدهای این ماژول‌ها در هر دو حالت از همین استاندارد پیروی می‌کنند: `TenantId` و `CreatorId`/`LastModifierId`/`DeleterId`، که داده‌شان با `Zero_IdMap` تبدیل می‌شود. برای ارجاع‌های **خود برنامه** به کاربر، نقش و Organization Unit:
+
+| | `source` (پیش‌فرض) | `guid` |
+|---|---|---|
+| `UserId`، `OwnerUserId`، `RoleId`… در کد و دیتابیس | همان نوع مبدا (long/int) | Guid (با تبدیل داده) |
+| اتصال به `IdentityUser`/`IdentityRole` | خصوصیت و ستون `LegacyId` (شناسه قدیم؛ ردیف‌های جدید از sequence شماره می‌گیرند) و `HasPrincipalKey("LegacyId")` برای هر navigation با کلید long/int | کلید Guid |
+| کاربر جاری | `CurrentUser.GetLegacyId()` / `GetRequiredLegacyId()` (claim `legacy_user_id`) | `CurrentUser.Id` |
+| پیدا کردن کاربر با شناسه قدیم | `ILegacyIdLookup.FindUserAsync(long)` و `user.GetLegacyId()` | — |
+
+### Viewهای SQL
+
+Viewهایی که با SQL خام در migrationهای قبلی ساخته شده‌اند، به جداول Module Zero و ستون‌های Audit ارجاع می‌دهند. `RenameModuleZeroTables` تعریفشان را در `Zero_ViewDefinitions` ذخیره و آن‌ها را حذف می‌کند. `AbpIoModules` دوباره می‌سازدشان (`Zero_RecreateViews`): نام ستون‌های Audit به‌روز می‌شود و Viewهای وابسته دوباره امتحان می‌شوند. Viewای که باز هم ساخته نشود، با خطایش در `Zero_ViewDefinitions` می‌ماند و در گزارش می‌آید. Entityهایی که به View نگاشت شده‌اند (`ToView`) هیچ‌وقت در migration تولیدشده مثل جدول تغییر داده نمی‌شوند.
 
 ## ماژول‌های Contract (`Domain.Shared` و `Application.Contracts`)
 

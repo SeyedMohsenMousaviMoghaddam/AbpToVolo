@@ -1,4 +1,5 @@
 using System.Text;
+using AbpToVolo.Core;
 using AbpToVolo.Mappings;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
@@ -26,7 +27,7 @@ internal static class ZeroForeignKeys
     internal sealed record Conversion(string Entity, string Schema, string Table, string Property, string Column, string NewProperty, string NewColumn, string Kind, bool Nullable);
 
     /// <summary>Columns of the solution's own entities that refer to Module Zero entities (by the ZeroMappings.GuidIdKind convention).</summary>
-    internal static List<Conversion> FindConversions(CompilationUnitSyntax snapshot, Func<string, bool> isZeroEntity)
+    internal static List<Conversion> FindConversions(CompilationUnitSyntax snapshot, Func<string, bool> isZeroEntity, IdTypeMode mode = IdTypeMode.Guid)
     {
         var blocks = EntityBlocks(snapshot).ToList();
 
@@ -59,7 +60,7 @@ internal static class ZeroForeignKeys
             foreach (var statement in body.Statements.OfType<ExpressionStatementSyntax>())
             {
                 if (PropertyOf(statement) is not var (type, property)) continue;
-                if (ZeroMappings.GuidIdKind(property, type) is not { } kind) continue;
+                if (ZeroMappings.GuidIdKind(property, type, mode) is not { } kind) continue;
 
                 var column = Calls(statement).FirstOrDefault(c => c.Name == "HasColumnName")?.Args.FirstOrDefault() ?? property;
                 var newProperty = TypeMappings.MemberRenames.GetValueOrDefault(property, property);
@@ -190,7 +191,9 @@ internal static class ZeroForeignKeys
         var exec = new StringBuilder();
         foreach (var c in conversions.OrderBy(c => c.Table, StringComparer.Ordinal).ThenBy(c => c.Column, StringComparer.Ordinal))
         {
-            exec.AppendLine($"EXEC dbo.Zero_ConvertColumnToGuid N'{c.Schema}', N'{c.Table}', N'{c.Column}', N'{c.NewColumn}', N'{c.Kind}';");
+            // Audit columns are informative (no foreign key in Boilerplate): a dangling id becomes NULL and is kept in Zero_UnmappedIds.
+            var onMissing = TypeMappings.MemberRenames.ContainsKey(c.Property) ? "null" : "fail";
+            exec.AppendLine($"EXEC dbo.Zero_ConvertColumnToGuid N'{c.Schema}', N'{c.Table}', N'{c.Column}', N'{c.NewColumn}', N'{c.Kind}', N'{onMissing}';");
         }
 
         return $$"""
@@ -236,6 +239,8 @@ internal static class ZeroForeignKeys
         var sb = new StringBuilder();
         sb.AppendLine("IF OBJECT_ID(N'dbo.Zero_IdMap') IS NULL");
         sb.AppendLine("    CREATE TABLE dbo.Zero_IdMap (EntityType nvarchar(32) NOT NULL, OldId bigint NOT NULL, NewId uniqueidentifier NOT NULL, PRIMARY KEY (EntityType, OldId));");
+        sb.AppendLine("IF OBJECT_ID(N'dbo.Zero_UnmappedIds') IS NULL");
+        sb.AppendLine("    CREATE TABLE dbo.Zero_UnmappedIds (TableName nvarchar(520) NOT NULL, ColumnName sysname NOT NULL, EntityType nvarchar(32) NOT NULL, OldId bigint NOT NULL, RowsCount int NOT NULL);");
         foreach (var (kind, table) in new[] { ("Tenant", "AbpTenants"), ("User", "AbpUsers"), ("Role", "AbpRoles"), ("OrganizationUnit", "AbpOrganizationUnits") })
         {
             var source = zeroTable(table);
@@ -253,7 +258,7 @@ internal static class ZeroForeignKeys
     /// Ids without a match in Zero_IdMap stop the migration (the column would lose data).
     /// </summary>
     internal const string ConvertProcedureSql = """
-        CREATE OR ALTER PROCEDURE dbo.Zero_ConvertColumnToGuid @Schema sysname, @Table sysname, @Column sysname, @NewColumn sysname, @EntityType nvarchar(32)
+        CREATE OR ALTER PROCEDURE dbo.Zero_ConvertColumnToGuid @Schema sysname, @Table sysname, @Column sysname, @NewColumn sysname, @EntityType nvarchar(32), @OnMissing nvarchar(10) = N'fail'
         AS
         BEGIN
             SET NOCOUNT ON;
@@ -299,10 +304,22 @@ internal static class ZeroForeignKeys
             SET @sql = N'UPDATE t SET ' + QUOTENAME(@tmp) + N' = m.NewId FROM ' + @full + N' t JOIN dbo.Zero_IdMap m ON m.EntityType = @type AND m.OldId = t.' + QUOTENAME(@Column) + N';';
             EXEC sp_executesql @sql, N'@type nvarchar(32)', @type = @EntityType;
 
+            -- 0 is the default int/long value (Boilerplate ids start at 1): it means "no value", so it becomes the default Guid.
+            SET @sql = N'UPDATE ' + @full + N' SET ' + QUOTENAME(@tmp) + N' = ''00000000-0000-0000-0000-000000000000'' WHERE ' + QUOTENAME(@Column) + N' = 0;';
+            EXEC sp_executesql @sql;
+
             DECLARE @missing int;
             SET @sql = N'SELECT @n = COUNT(*) FROM ' + @full + N' WHERE ' + QUOTENAME(@Column) + N' IS NOT NULL AND ' + QUOTENAME(@tmp) + N' IS NULL;';
             EXEC sp_executesql @sql, N'@n int OUTPUT', @n = @missing OUTPUT;
-            IF @missing > 0
+            IF @missing > 0 AND @OnMissing = N'null'
+            BEGIN
+                -- informative column: the dangling ids are kept for review, the new column stays NULL for them
+                SET @sql = N'INSERT INTO dbo.Zero_UnmappedIds (TableName, ColumnName, EntityType, OldId, RowsCount) SELECT @t, @c, @type, ' + QUOTENAME(@Column) + N', COUNT(*) FROM ' + @full
+                    + N' WHERE ' + QUOTENAME(@Column) + N' IS NOT NULL AND ' + QUOTENAME(@tmp) + N' IS NULL GROUP BY ' + QUOTENAME(@Column) + N';';
+                EXEC sp_executesql @sql, N'@t sysname, @c sysname, @type nvarchar(32)', @t = @full, @c = @Column, @type = @EntityType;
+                PRINT CONCAT(@full, N'.', @Column, N': ', @missing, N' rows refer to a missing ', @EntityType, N' (set to NULL, see dbo.Zero_UnmappedIds)');
+            END
+            ELSE IF @missing > 0
             BEGIN
                 DECLARE @message nvarchar(2048) = CONCAT(@full, N'.', @Column, N': ', @missing, N' rows refer to a ', @EntityType, N' id that does not exist (no row in Zero_IdMap). Fix or clear them, then run the migration again.');
                 THROW 50001, @message, 1;

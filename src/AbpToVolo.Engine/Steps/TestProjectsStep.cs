@@ -591,6 +591,13 @@ public sealed partial class TestProjectsStep : IMigrationStep
                         configurationContext.DbContextOptions.UseSqlite(_sqliteConnection{{(spatial ? ", sqlite => sqlite.UseNetTopologySuite()" : "")}});
                         configurationContext.DbContextOptions.ReplaceService<IModelCustomizer, SqliteTestModelCustomizer>();
                     });
+
+                    /* The application module may configure this DbContext specifically (Boilerplate DbContextConfigurer): override it. */
+                    options.Configure<{{dbContext}}>(configurationContext =>
+                    {
+                        configurationContext.DbContextOptions.UseSqlite(_sqliteConnection{{(spatial ? ", sqlite => sqlite.UseNetTopologySuite()" : "")}});
+                        configurationContext.DbContextOptions.ReplaceService<IModelCustomizer, SqliteTestModelCustomizer>();
+                    });
                 });
             }
 

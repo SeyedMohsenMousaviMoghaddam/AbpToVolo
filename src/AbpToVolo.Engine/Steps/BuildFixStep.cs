@@ -51,11 +51,30 @@ public sealed partial class BuildFixStep : IMigrationStep
         var lastErrors = -1;
         var stubbed = new List<string>();
         var maxIterations = context.Options.StubUnresolved ? MaxIterationsWithStubs : MaxIterations;
+        var retries = 0;
         for (var iteration = 1; iteration <= maxIterations; iteration++)
         {
             context.Progress(iteration - 1, maxIterations, $"build {iteration}");
             var result = DotnetBuild.Run(target, context.OutputRoot, context.CancellationToken);
             lastErrors = result.Errors.Count + result.OtherErrors.Count;
+
+            // Only non-compiler errors (a file locked by an IDE or a running process, MSB3021/MSB3027...): they say nothing
+            // about the code. Log them and build again a few times before giving up.
+            if (result.Errors.Count == 0 && result.OtherErrors.Count > 0)
+            {
+                foreach (var other in result.OtherErrors.Take(3)) context.Log.WriteLine($"build {iteration}: {other.Trim()}");
+                if (FixPackageDowngrades(context, result.OtherErrors, totals) > 0) continue;
+                if (++retries <= 3)
+                {
+                    context.Log.WriteLine($"build {iteration}: {result.OtherErrors.Count} build errors that are not compiler errors — retrying in 10 s (close the programs that use the output, e.g. Visual Studio)");
+                    Thread.Sleep(TimeSpan.FromSeconds(10));
+                    iteration--;
+                    continue;
+                }
+
+                context.Report.Warning(Name, "The build stopped with errors that are not compiler errors: " + string.Join(" | ", result.OtherErrors.Take(3).Select(e => e.Trim())));
+                break;
+            }
             if (lastErrors == 0)
             {
                 context.Log.WriteLine($"build {iteration}: no errors");
@@ -191,18 +210,32 @@ public sealed partial class BuildFixStep : IMigrationStep
                     original = code[block.OpenBraceToken.Span.End..block.CloseBraceToken.SpanStart].Trim('\r', '\n');
                 }
 
+                // Modules and DbContexts run at startup: a throwing stub would stop the whole application, so their
+                // members that return nothing become no-ops (reported as warnings) instead.
+                var startup = IsStartupCode(member);
+                var stubStatement = startup
+                    ? $"{indent}    // AbpToVolo: skipped until fixed — the application starts without this code (see the report)."
+                    : $"{indent}    throw new System.NotImplementedException(\"AbpToVolo: {type}.{name} did not compile after the conversion; see #if {OriginalCodeSymbol}.\");";
                 var replacement =
                     $"{{{newline}" +
                     $"#if {OriginalCodeSymbol} // TODO [AbpToVolo]: did not compile after the conversion ({message.Replace(newline, " ")}). Fix the code and remove the #if.{newline}" +
                     $"{original}{newline}" +
                     $"#endif{newline}" +
-                    $"{indent}    throw new System.NotImplementedException(\"AbpToVolo: {type}.{name} did not compile after the conversion; see #if {OriginalCodeSymbol}.\");{newline}" +
+                    $"{stubStatement}{newline}" +
                     $"{indent}}}";
                 result = result[..span.Start] + replacement + result[span.End..];
 
                 var location = $"{context.Relative(group.Key)}:{text.Lines.GetLinePosition(member.SpanStart).Line + 1}";
-                stubbed.Add($"`{type}.{name}` ({location}) — {message}");
-                context.Report.Todo(Name, $"{type}.{name} throws NotImplementedException: its converted body did not compile ({message}); see #if {OriginalCodeSymbol}.", location);
+                stubbed.Add($"`{type}.{name}` ({location}){(startup ? " [skipped at startup]" : "")} — {message}");
+                if (startup)
+                {
+                    context.Report.Warning(Name, $"{type}.{name} is SKIPPED at startup (no-op): its converted body did not compile ({message}); " +
+                                                 $"the application runs without it until it is fixed — see #if {OriginalCodeSymbol}.", location);
+                }
+                else
+                {
+                    context.Report.Todo(Name, $"{type}.{name} throws NotImplementedException: its converted body did not compile ({message}); see #if {OriginalCodeSymbol}.", location);
+                }
                 count++;
             }
 
@@ -210,6 +243,28 @@ public sealed partial class BuildFixStep : IMigrationStep
         }
 
         return count;
+    }
+
+    /// <summary>
+    /// A member of a module or DbContext that returns nothing (void method, constructor, setter, async method without
+    /// result): code that runs while the application starts.
+    /// </summary>
+    private static bool IsStartupCode(SyntaxNode member)
+    {
+        var owner = member.Ancestors().OfType<ClassDeclarationSyntax>().FirstOrDefault();
+        if (owner is null || !(SyntaxHelpers.HasBaseType(owner, "AbpModule") || owner.Identifier.Text.EndsWith("DbContext", StringComparison.Ordinal)))
+        {
+            return false;
+        }
+
+        return member switch
+        {
+            ConstructorDeclarationSyntax => true,
+            AccessorDeclarationSyntax a => a.Keyword.Text is "set" or "init",
+            MethodDeclarationSyntax { ReturnType: PredefinedTypeSyntax { Keyword.Text: "void" } } => true,
+            MethodDeclarationSyntax m => m.Modifiers.Any(SyntaxKind.AsyncKeyword) && m.ReturnType is IdentifierNameSyntax { Identifier.Text: "Task" },
+            _ => false
+        };
     }
 
     /// <summary>NU1605 "Detected package downgrade: X from 13.0.4 to 13.0.3" → reference X 13.0.4 in that project.</summary>

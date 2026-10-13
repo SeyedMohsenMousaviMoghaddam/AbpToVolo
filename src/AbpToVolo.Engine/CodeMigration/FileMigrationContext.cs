@@ -30,6 +30,9 @@ public sealed class FileMigrationContext
     /// <summary>True when the file contains Module Zero types (users, roles, tenants...).</summary>
     public bool UsesZero { get; set; }
 
+    /// <summary>Key types of the references to Module Zero users/roles/organization units (see MigrationOptions.IdType).</summary>
+    public IdTypeMode IdType { get; init; } = IdTypeMode.Source;
+
     public void RequireUsing(string? ns)
     {
         if (!string.IsNullOrWhiteSpace(ns)) RequiredUsings.Add(ns);

@@ -30,7 +30,7 @@ public sealed class UpdateWorkflowTests : IDisposable
     {
         var steps = MigrationEngine.DefaultSteps()
             .Select(s => s is ResolveVersionsStep ? new ResolveVersionsStep(_ => null) : s)
-            .Where(s => s is not (BuildVerificationStep or BuildFixStep));
+            .Where(s => s is not (BuildVerificationStep or BuildFixStep or AbpIoModulesMigrationStep));
         new MigrationEngine(steps).Run(new MigrationOptions { InputPath = SamplePath, OutputPath = _output, Force = true }, TextWriter.Null);
     }
 

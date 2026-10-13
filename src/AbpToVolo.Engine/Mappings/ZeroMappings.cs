@@ -1,3 +1,5 @@
+using AbpToVolo.Core;
+
 namespace AbpToVolo.Mappings;
 
 public enum ZeroKind
@@ -30,11 +32,16 @@ public static class ZeroMappings
     /// database conversion (ZeroForeignKeys), so the model and the database columns stay consistent.
     /// Returns "Tenant", "User", "Role" or "OrganizationUnit" (the EntityType of Zero_IdMap).
     /// </summary>
-    public static string? GuidIdKind(string name, string type)
+    public static string? GuidIdKind(string name, string type, IdTypeMode mode = IdTypeMode.Guid)
     {
         var numeric = type.TrimEnd('?');
         if (numeric is not ("int" or "long")) return null;
         if (name.EndsWith("TenantId", StringComparison.Ordinal) || name == "tenantId") return "Tenant";
+
+        // ABP.io module fields are Guid in both modes: the audit fields (CreatorUserId → CreatorId...). With IdTypeMode.Source
+        // the application's own references to users/roles/organization units keep their type (linked through LegacyId).
+        if (TypeMappings.MemberRenames.ContainsKey(name)) return numeric == "long" ? "User" : null;
+        if (mode == IdTypeMode.Source) return null;
         if (name.EndsWith("UserId", StringComparison.Ordinal) || name == "userId") return numeric == "long" ? "User" : null;
         if (name.EndsWith("RoleId", StringComparison.Ordinal) || name == "roleId") return "Role";
         if (name.EndsWith("OrganizationUnitId", StringComparison.Ordinal) || name == "organizationUnitId") return "OrganizationUnit";

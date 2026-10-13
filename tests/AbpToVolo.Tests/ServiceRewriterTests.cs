@@ -1,3 +1,4 @@
+using AbpToVolo.Core;
 namespace AbpToVolo.Tests;
 
 public class ServiceRewriterTests : RewriterTestBase
@@ -132,13 +133,20 @@ public class ServiceRewriterTests : RewriterTestBase
             }
             """;
 
-        var (code, _) = Migrate(source);
+        var (code, _) = Migrate(source, idType: IdTypeMode.Guid);
 
         AssertContains("private readonly ICurrentUser _abpSession;", code);
         AssertContains("var userId = CurrentUser.Id;", code);
         AssertContains("var tenantId = CurrentTenant.Id;", code);
         AssertContains("var id = CurrentUser.GetId();", code);
         AssertContains("var other = _abpSession.Id;", code);
+
+        // --id-type source (default): user ids keep the source type, the legacy id of the current user
+        var (legacy, _) = Migrate(source);
+        AssertContains("var userId = CurrentUser.GetLegacyId();", legacy);
+        AssertContains("var id = CurrentUser.GetRequiredLegacyId();", legacy);
+        AssertContains("var other = _abpSession.GetLegacyId();", legacy);
+        AssertContains("var tenantId = CurrentTenant.Id;", legacy); // ABP.io module field: Guid in both modes
         AssertContains("await AuthorizationService.IsGrantedAsync(\"P\");", code);
         AssertContains("await SettingManager.GetOrNullForCurrentUserAsync(\"Theme\");", code);
         AssertContains("using (DataFilter.Disable<ISoftDelete>())", code);

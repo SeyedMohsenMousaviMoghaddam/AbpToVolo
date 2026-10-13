@@ -149,6 +149,10 @@ public class ModuleRewriterTests : RewriterTestBase
         AssertContains("options.ConventionalControllers.Create(typeof(AcmeApplicationModule).Assembly);", code);
         AssertContains("Configure<AbpExceptionHandlingOptions>(options => { options.SendExceptionsDetailsToClients = true; });", code);
         AssertNotContains("DefaultNameOrConnectionString", code);
+
+        // [ReplaceDbContext] needs the application DbContext registered after the module DbContexts (ConfigureServices)
+        var configureServices = code.IndexOf("public override void ConfigureServices(ServiceConfigurationContext context)", StringComparison.Ordinal);
+        Assert.True(configureServices >= 0 && code.IndexOf("AddAbpDbContext<AcmeDbContext>", StringComparison.Ordinal) > configureServices);
     }
 
     [Fact]
@@ -230,6 +234,42 @@ public class ModuleRewriterTests : RewriterTestBase
         AssertContains("_appConfiguration = context.Services.GetConfiguration();", code);
         AssertContains("public override void PreConfigureServices(ServiceConfigurationContext context)", code);
         AssertContains("var url = _appConfiguration[\"App:Url\"];", code);
+    }
+
+    [Fact]
+    public void Boilerplate_jwt_configuration_and_application_parts_are_removed()
+    {
+        const string source = """
+            using Abp.Modules;
+
+            public class AcmeWebCoreModule : AbpModule
+            {
+                public override void PreInitialize()
+                {
+                    ConfigureTokenAuth();
+                }
+
+                private void ConfigureTokenAuth()
+                {
+                    IocManager.Register<TokenAuthConfiguration>();
+                    var tokenAuthConfig = IocManager.Resolve<TokenAuthConfiguration>();
+                    tokenAuthConfig.Issuer = "x";
+                }
+
+                public override void PostInitialize()
+                {
+                    IocManager.Resolve<ApplicationPartManager>()
+                        .AddApplicationPartsIfNotAddedBefore(typeof(AcmeWebCoreModule).Assembly);
+                }
+            }
+            """;
+
+        var (code, _) = Migrate(source);
+
+        Assert.DoesNotContain("tokenAuthConfig.Issuer", code);
+        AssertContains("is replaced by OpenIddict in ABP.io", code);
+        Assert.DoesNotContain(".AddApplicationPartsIfNotAddedBefore(typeof(", code);
+        AssertContains("ConfigureTokenAuth();", code);
     }
 
     [Fact]

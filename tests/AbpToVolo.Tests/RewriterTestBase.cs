@@ -11,10 +11,10 @@ public abstract class RewriterTestBase
         new("PhoneBook", "PhoneBookResource", "Acme.PhoneBook.Localization", "/Localization/PhoneBook", "en", "Acme.Test", ["en", "fa"]);
 
     protected static (string Code, FileMigrationContext Context) Migrate(
-        string code, ProjectLayer layer = ProjectLayer.Unknown, LocalizationResourceInfo? localization = null)
+        string code, ProjectLayer layer = ProjectLayer.Unknown, LocalizationResourceInfo? localization = null, IdTypeMode idType = IdTypeMode.Source)
     {
         var project = new ProjectInfo { Name = "Acme.Test", CsprojPath = @"C:\x\Acme.Test.csproj", Layer = layer, RootNamespace = "Acme" };
-        var context = new FileMigrationContext("Test.cs", "\n", project, localization);
+        var context = new FileMigrationContext("Test.cs", "\n", project, localization) { IdType = idType };
         var result = CSharpFileMigrator.Migrate(code.ReplaceLineEndings("\n"), context);
 
         var errors = CSharpSyntaxTree.ParseText(result.Code).GetDiagnostics().Where(d => d.Severity == DiagnosticSeverity.Error).ToList();

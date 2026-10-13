@@ -1,3 +1,4 @@
+using AbpToVolo.Core;
 using AbpToVolo.Steps;
 using Microsoft.CodeAnalysis.CSharp;
 
@@ -93,10 +94,58 @@ public sealed class ZeroKeysTests : RewriterTestBase
         var root = CSharpSyntaxTree.ParseText(Snapshot).GetCompilationUnitRoot();
         var migration = ZeroForeignKeys.Migration("App.Migrations", ZeroForeignKeys.FindConversions(root, IsZero), t => "Zero_" + t);
 
-        Assert.Contains("EXEC dbo.Zero_ConvertColumnToGuid N'dbo', N'Notes', N'CreatorUserId', N'CreatorId', N'User';", migration);
+        Assert.Contains("EXEC dbo.Zero_ConvertColumnToGuid N'dbo', N'Notes', N'CreatorUserId', N'CreatorId', N'User', N'null';", migration);
+        Assert.Contains("N'OwnerUserId', N'OwnerUserId', N'User', N'fail';", migration); // a real foreign key: dangling ids stop the migration
         Assert.Contains("FROM dbo.[Zero_AbpUsers] z", migration);
         Assert.Contains("CREATE OR ALTER PROCEDURE dbo.Zero_ConvertColumnToGuid", migration);
         Assert.Empty(CSharpSyntaxTree.ParseText(migration).GetDiagnostics());
+    }
+
+    [Fact]
+    public void AbpIoModules_migration_keeps_the_zero_tables_and_copies_the_data_before_the_foreign_keys()
+    {
+        const string migration = """
+            using Microsoft.EntityFrameworkCore.Migrations;
+
+            public partial class AbpIoModules : Migration
+            {
+                protected override void Up(MigrationBuilder migrationBuilder)
+                {
+                    migrationBuilder.DropTable(
+                        name: "Zero_AbpUsers");
+
+                    migrationBuilder.CreateTable(
+                        name: "AbpUsers",
+                        columns: table => new { });
+
+                    migrationBuilder.AddForeignKey(
+                        name: "FK_Notes_AbpUsers_CreatorId",
+                        table: "Notes",
+                        column: "CreatorId",
+                        principalTable: "AbpUsers",
+                        principalColumn: "Id");
+                }
+
+                protected override void Down(MigrationBuilder migrationBuilder)
+                {
+                    migrationBuilder.DropTable(
+                        name: "AbpUsers");
+
+                    migrationBuilder.CreateTable(
+                        name: "Zero_AbpUsers",
+                        columns: table => new { });
+                }
+            }
+            """;
+
+        var (code, dropped) = AbpIoModulesMigrationStep.MakeSafe(migration, "INSERT INTO dbo.[AbpUsers] SELECT \"x\";");
+
+        Assert.Equal(1, dropped);
+        Assert.DoesNotContain("name: \"Zero_AbpUsers\"", code);
+        var sql = code.IndexOf("migrationBuilder.Sql(", StringComparison.Ordinal);
+        Assert.True(code.IndexOf("CreateTable(", StringComparison.Ordinal) < sql && sql < code.IndexOf("AddForeignKey(", StringComparison.Ordinal));
+        AssertContains("SELECT \"\"x\"\";", code); // verbatim string escaping
+        Assert.Empty(CSharpSyntaxTree.ParseText(code).GetDiagnostics());
     }
 
     [Fact]
@@ -152,9 +201,25 @@ public sealed class ZeroKeysTests : RewriterTestBase
             }
             """;
 
-        var (code, _) = Migrate(source);
+        var (code, _) = Migrate(source, idType: IdTypeMode.Guid);
 
         Assert.Contains("public Guid RoleId { get; set; }", code);
         Assert.Contains("[ForeignKey(\"CreatorId\")]", code);
+
+        // --id-type source (default): the application's references keep their type; audit fields are ABP.io's (Guid)
+        var (legacy, _) = Migrate(source);
+        Assert.Contains("public int RoleId { get; set; }", legacy);
+        Assert.Contains("[ForeignKey(\"CreatorId\")]", legacy);
+    }
+
+    [Fact]
+    public void Source_id_type_converts_only_tenant_and_audit_columns()
+    {
+        var root = CSharpSyntaxTree.ParseText(Snapshot).GetCompilationUnitRoot();
+        var conversions = ZeroForeignKeys.FindConversions(root, IsZero, IdTypeMode.Source);
+
+        Assert.Contains(conversions, c => c.Column == "CreatorUserId");
+        Assert.Contains(conversions, c => c.Column == "TenantId");
+        Assert.DoesNotContain(conversions, c => c.Column == "OwnerUserId"); // the application's own reference keeps long
     }
 }

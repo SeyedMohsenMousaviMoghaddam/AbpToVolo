@@ -1,3 +1,4 @@
+using AbpToVolo.Core;
 using AbpToVolo.Mappings;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
@@ -78,10 +79,12 @@ public sealed class ServiceMembersRewriter : MigrationRewriter
         {
             Context.RequireUsing("Volo.Abp.Users");
             Context.RequireUsing("Volo.Abp.MultiTenancy");
+            // IdTypeMode.Source: the application's user ids stay long — the legacy id of the current user (claim).
+            var legacy = Context.IdType == IdTypeMode.Source;
             var replacement = member switch
             {
-                "UserId" => "CurrentUser.Id",
-                "GetUserId" => "CurrentUser.GetId",
+                "UserId" => legacy ? "CurrentUser.GetLegacyId()" : "CurrentUser.Id",
+                "GetUserId" => legacy ? "CurrentUser.GetRequiredLegacyId" : "CurrentUser.GetId",
                 "TenantId" => "CurrentTenant.Id",
                 "GetTenantId" => "CurrentTenant.GetId",
                 "ImpersonatorUserId" => "CurrentUser.FindImpersonatorUserId",
@@ -102,6 +105,14 @@ public sealed class ServiceMembersRewriter : MigrationRewriter
         // _abpSession.UserId (injected IAbpSession, now ICurrentUser)
         if (receiver is IdentifierNameSyntax session && session.Identifier.Text.Contains("abpSession", StringComparison.OrdinalIgnoreCase))
         {
+            if (Context.IdType == IdTypeMode.Source && member is "UserId" or "GetUserId")
+            {
+                Context.Change($"{session.Identifier.Text}.{member} → legacy user id (IdTypeMode.Source)");
+                return member == "UserId"
+                    ? SyntaxHelpers.Expr($"{session.Identifier.Text}.GetLegacyId()").WithTriviaFrom(visited)
+                    : visited.WithName(IdentifierName("GetRequiredLegacyId").WithTriviaFrom(visited.Name));
+            }
+
             var renamed = member switch { "UserId" => "Id", "GetUserId" => "GetId", _ => null };
             if (renamed is not null)
             {

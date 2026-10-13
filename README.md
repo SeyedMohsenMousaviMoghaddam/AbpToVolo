@@ -32,6 +32,10 @@ The Windows app sets the source and destination folders, the ABP version, target
 | `--migrations squash\|delete\|keep` | Squash the EF Core migrations keeping the history (default), delete them, or keep them as they are |
 | `--no-compiler-fixes` | Do not build the output and fix compiler errors |
 | `--stub-unresolved` | Members that still do not compile keep their converted body under `#if ABPTOVOLO_ORIGINAL` and throw `NotImplementedException`, so the whole solution compiles (each one is listed in the report) |
+| `--id-type source\|guid` | Key type of the application's references to users/roles (`UserId`, `RoleId`…): `source` (default) keeps the source type (long/int), linked to the ABP.io entities through `LegacyId`; `guid` converts them to Guid. ABP.io module fields (`TenantId`, `CreatorId`…) are Guid in both |
+| `--connection-string <cs>` | `ConnectionStrings:Default` of the converted host and DbMigrator (or `ABPTOVOLO_CONNECTION_STRING`; never saved with the settings) |
+| `--migrate-database` | Run the converted DbMigrator after the conversion (**changes that database — use a copy**) |
+| `--verify-host` | Start the converted host, check that Swagger answers (`/swagger/v1/swagger.json`, `/swagger/index.html`), stop it; the result is in the report |
 | `--build`, `--force`, `--verbose` | Final build with the errors in the report, replace a non-empty output, full log |
 
 Output: the converted solution, `ABP-MIGRATION-REPORT.md` (checklist of the manual work, with lines), `abp-migration-report.json` and `abp-migration.log` (full log of every step).
@@ -115,6 +119,21 @@ So the application's Module Zero classes are not ported; the code is connected t
   2. Migration `ConvertModuleZeroKeys` builds `Zero_IdMap` (old id → new Guid) and converts the columns of the **application's own tables** through it: user/tenant/role foreign keys (`UserId bigint`, `TenantId int`, `RoleId int` → `uniqueidentifier`) and the audit columns (`CreatorUserId` → `CreatorId`, `LastModifierUserId` → `LastModifierId`, `DeleterUserId` → `DeleterId`). Old FKs are dropped and indexes recreated; an id without a mapping stops the migration with a clear message. The snapshot is updated too, so the next migration (`AbpIoModules`) only adds the ABP.io tables and the new FKs instead of dropping columns.
   3. Script `ModuleZeroDataMigration.sql` copies users, roles, tenants, user roles and permissions into the ABP.io tables with **the same `Zero_IdMap` Guids** (password hashes are compatible: both use ASP.NET Core Identity).
 - The code follows the same id rule (`ZeroMappings.GuidIdKind`): `*UserId`/`*TenantId`/`*RoleId`/`*OrganizationUnitId` properties, parameters and variables become `Guid`, and `[ForeignKey("CreatorUserId")]`/`HasForeignKey("…")` strings get the ABP.io names, so the EF model and the database stay consistent.
+
+### Key types (`--id-type`)
+
+ABP.io's Identity and TenantManagement modules use Guid keys. The module fields follow that standard in both modes (`TenantId`, `CreatorId`/`LastModifierId`/`DeleterId`, converted with their data through `Zero_IdMap`). For the application's **own** references to users, roles and organization units:
+
+| | `source` (default) | `guid` |
+|---|---|---|
+| `UserId`, `OwnerUserId`, `RoleId`… in code and database | keep the source type (long/int) | Guid (data converted) |
+| Link to `IdentityUser`/`IdentityRole` | `LegacyId` extension property/column (old id; new rows numbered by a sequence), `HasPrincipalKey("LegacyId")` for every navigation with a long/int key | the Guid key |
+| Current user | `CurrentUser.GetLegacyId()` / `GetRequiredLegacyId()` (claim `legacy_user_id`) | `CurrentUser.Id` |
+| Find a user by the old id | `ILegacyIdLookup.FindUserAsync(long)`, `user.GetLegacyId()` | — |
+
+### SQL views
+
+Views (raw SQL of the old migrations) reference the Module Zero tables and the audit columns. `RenameModuleZeroTables` saves their definitions in `Zero_ViewDefinitions` and drops them; `AbpIoModules` recreates them (`Zero_RecreateViews`, audit column names updated, dependent views retried). A view that still fails is kept with its error in `Zero_ViewDefinitions` and listed in the report. Entity types mapped to views (`ToView`) are never altered as tables by the generated migration.
 
 ## Contract projects (`Domain.Shared`, `Application.Contracts`)
 

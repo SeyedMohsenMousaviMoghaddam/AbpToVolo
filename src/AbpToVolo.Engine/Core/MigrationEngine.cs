@@ -36,6 +36,7 @@ public sealed class MigrationEngine
         new ServiceBasesStep(),        // {Prefix}DomainService / {Prefix}AppService bases (ABP.io template convention)
         new ContractsStep(),           // needs the converted code (PermissionDefinitionProvider, [AutoMap]...)
         new AbpModulesStep(),          // Identity/Account/OpenIddict/... module dependencies, DbContext integration
+        new LegacyIdStep(),            // --id-type source: LegacyId on IdentityUser/IdentityRole, principal keys, helpers
         new LayerServicesStep(),       // framework services each layer injects (HttpClient, SignalR)
         new HostStandardizationStep(), // ABP.io HttpApi.Host (module + Program.cs) and DbMigrator
         new TestProjectsStep(),        // needs the final layout (interfaces in Application.Contracts)
@@ -43,6 +44,8 @@ public sealed class MigrationEngine
         new ResolveVersionsStep(),
         new ProjectFileStep(),
         new BuildFixStep(),            // builds with the real compiler and fixes what the diagnostics point to
+        new AbpIoModulesMigrationStep(), // dotnet ef migrations add AbpIoModules, made safe for existing databases
+        new HostVerificationStep(),    // opt-in: run the DbMigrator, start the host and check Swagger
         new ResidualScanStep(),
         new BuildVerificationStep(),
         new ReportWriterStep()

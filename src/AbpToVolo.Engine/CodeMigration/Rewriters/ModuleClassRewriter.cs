@@ -52,7 +52,78 @@ public sealed partial class ModuleClassRewriter : MigrationRewriter
         Context.RequireUsing("Volo.Abp");
         var result = base.VisitClassDeclaration(node);
         _module = previous;
-        return result is ClassDeclarationSyntax module ? RemoveBaseLifecycleCalls(InjectHostServices(module)) : result;
+        return result is ClassDeclarationSyntax module ? MoveDbContextRegistration(RemoveTemplateCode(RemoveBaseLifecycleCalls(InjectHostServices(module)))) : result;
+    }
+
+    /// <summary>
+    /// Boilerplate registered the DbContext in PreInitialize; ABP.io's [ReplaceDbContext] (IIdentityDbContext,
+    /// ITenantManagementDbContext...) only works when the application DbContext is registered after the module ones,
+    /// i.e. in ConfigureServices (ABP.io template). The statements with AddAbpDbContext move from PreConfigureServices
+    /// to the start of ConfigureServices (with their enclosing if).
+    /// </summary>
+    private ClassDeclarationSyntax MoveDbContextRegistration(ClassDeclarationSyntax module)
+    {
+        var pre = module.Members.OfType<MethodDeclarationSyntax>().FirstOrDefault(m => m.Identifier.Text == "PreConfigureServices" && m.Body is not null);
+        var moved = pre?.Body!.Statements.Where(s => s.ToString().Contains(".AddAbpDbContext<", StringComparison.Ordinal)).ToList() ?? [];
+        if (pre is null || moved.Count == 0) return module;
+
+        Context.Change($"Module {module.Identifier.Text}: AddAbpDbContext moved from PreConfigureServices to ConfigureServices ([ReplaceDbContext] needs it after the module DbContexts)");
+        var updated = module.ReplaceNode(pre, pre.WithBody(pre.Body!.WithStatements(List(pre.Body.Statements.Where(s => !moved.Contains(s))))));
+
+        var configure = updated.Members.OfType<MethodDeclarationSyntax>().FirstOrDefault(m => m.Identifier.Text == "ConfigureServices" && m.Body is not null);
+        if (configure is not null)
+        {
+            return updated.ReplaceNode(configure, configure.WithBody(configure.Body!.WithStatements(configure.Body.Statements.InsertRange(0, moved))));
+        }
+
+        var indent = SyntaxHelpers.Indentation(pre);
+        var method = ParseMemberDeclaration($"{indent}public override void ConfigureServices(ServiceConfigurationContext context){Context.NewLine}{indent}{{{Context.NewLine}{indent}}}{Context.NewLine}")!;
+        method = ((MethodDeclarationSyntax)method).WithBody(((MethodDeclarationSyntax)method).Body!.WithStatements(List(moved)));
+        var preIndex = updated.Members.IndexOf(updated.Members.OfType<MethodDeclarationSyntax>().First(m => m.Identifier.Text == "PreConfigureServices"));
+        return updated.WithMembers(updated.Members.Insert(preIndex + 1, method.WithLeadingTrivia(EndOfLine(Context.NewLine))));
+    }
+
+    /// <summary>
+    /// Code of the Boilerplate web template that ABP.io does itself:
+    ///   ConfigureTokenAuth() { var tokenAuthConfig = IocManager.Resolve&lt;TokenAuthConfiguration&gt;(); ... JWT ... }
+    ///     → empty (ABP.io authenticates with OpenIddict: AuthServer / OpenIddict settings of the host)
+    ///   ApplicationPartManager.AddApplicationPartsIfNotAddedBefore(assembly)
+    ///     → removed (ABP.io adds the controllers of every module assembly)
+    /// </summary>
+    private ClassDeclarationSyntax RemoveTemplateCode(ClassDeclarationSyntax module)
+    {
+        var tokenAuth = module.Members.OfType<MethodDeclarationSyntax>()
+            .Where(m => m.Body is not null && m.Body.ToFullString().Contains("TokenAuthConfiguration", StringComparison.Ordinal))
+            .ToList();
+        var applicationParts = module.DescendantNodes().OfType<ExpressionStatementSyntax>()
+            .Where(s => s.Expression is InvocationExpressionSyntax { Expression: MemberAccessExpressionSyntax { Name.Identifier.Text: "AddApplicationPartsIfNotAddedBefore" } })
+            .Where(s => !tokenAuth.Any(m => m.Span.Contains(s.Span)))
+            .ToList();
+        if (tokenAuth.Count == 0 && applicationParts.Count == 0) return module;
+
+        var nl = Context.NewLine;
+        var updated = module.ReplaceNodes(tokenAuth.Cast<SyntaxNode>().Concat(applicationParts), (original, rewritten) =>
+        {
+            if (rewritten is MethodDeclarationSyntax method)
+            {
+                Context.Change($"Module {module.Identifier.Text}: {method.Identifier.Text}() — Boilerplate JWT configuration removed (ABP.io uses OpenIddict)");
+                var indent = SyntaxHelpers.Indentation(method);
+                var comment = Comment("// AbpToVolo: Boilerplate's TokenAuthConfiguration (JWT bearer) is replaced by OpenIddict in ABP.io: " +
+                                      "configure the AuthServer / OpenIddict sections of the host's appsettings.json instead.");
+                var body = Block().WithOpenBraceToken(Token(SyntaxKind.OpenBraceToken).WithTrailingTrivia(EndOfLine(nl)))
+                    .WithCloseBraceToken(Token(TriviaList(Whitespace(indent + "    "), comment, EndOfLine(nl), Whitespace(indent)), SyntaxKind.CloseBraceToken, method.Body!.CloseBraceToken.TrailingTrivia))
+                    .WithLeadingTrivia(method.Body.GetLeadingTrivia());
+                return method.WithBody(body);
+            }
+
+            Context.Change("ApplicationPartManager.AddApplicationPartsIfNotAddedBefore removed (ABP.io adds the controllers of every module)");
+            var statement = (StatementSyntax)rewritten;
+            return ParseStatement("{ }").WithLeadingTrivia(statement.GetLeadingTrivia()
+                    .Add(Comment("/* AbpToVolo: AddApplicationPartsIfNotAddedBefore removed — ABP.io adds the controllers of every module assembly. */"))
+                    .Add(Space))
+                .WithTrailingTrivia(statement.GetTrailingTrivia());
+        });
+        return updated;
     }
 
     /// <summary>base.PreInitialize(); etc.: the Boilerplate base methods are gone (ABP.io's are empty).</summary>
@@ -410,6 +481,23 @@ public sealed partial class ModuleClassRewriter : MigrationRewriter
             Context.RequireUsing("Volo.Abp.EntityFrameworkCore");
             Context.RequireUsing("Microsoft.Extensions.DependencyInjection");
             Context.Change($"AbpEfCore().AddDbContext<{type}> → context.Services.AddAbpDbContext<{type}> + AbpDbContextOptions");
+
+            // The Boilerplate lambda (XDbContextConfigurer.Configure(options.DbContextOptions, options.ConnectionString):
+            // provider, NetTopologySuite, retry...) is kept as it is: ABP.io's AbpDbContextConfigurationContext<T> has the
+            // same DbContextOptions / ConnectionString / ExistingConnection members.
+            var configureLambda = statement.DescendantNodes().OfType<InvocationExpressionSyntax>()
+                .FirstOrDefault(i => i.Expression is MemberAccessExpressionSyntax { Name: GenericNameSyntax { Identifier.Text: "AddDbContext" } })?
+                .ArgumentList.Arguments.FirstOrDefault()?.Expression as LambdaExpressionSyntax;
+            if (configureLambda is not null && configureLambda.ToString().Contains("Configurer.Configure(", StringComparison.Ordinal))
+            {
+                return new Outcome(
+                    [
+                        Stmt($"context.Services.AddAbpDbContext<{type}>(options => {{ options.AddDefaultRepositories(includeAllEntities: true); }});"),
+                        Stmt($"Configure<AbpDbContextOptions>(options => {{ options.UseSqlServer(); options.Configure<{type}>({configureLambda}); }});")
+                    ],
+                    [$"AbpToVolo: {type} keeps its Boilerplate configuration (DbContextConfigurer); the other DbContexts use SQL Server."]);
+            }
+
             return new Outcome(
                 [
                     Stmt($"context.Services.AddAbpDbContext<{type}>(options => {{ options.AddDefaultRepositories(includeAllEntities: true); }});"),

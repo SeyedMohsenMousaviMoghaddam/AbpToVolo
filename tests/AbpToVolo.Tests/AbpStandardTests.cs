@@ -16,7 +16,7 @@ public sealed class AbpStandardTests : IDisposable
     {
         var steps = MigrationEngine.DefaultSteps()
             .Select(s => s is ResolveVersionsStep ? new ResolveVersionsStep(_ => null) : s)
-            .Where(s => s is not (BuildVerificationStep or BuildFixStep));
+            .Where(s => s is not (BuildVerificationStep or BuildFixStep or AbpIoModulesMigrationStep));
         _report = new MigrationEngine(steps).Run(new MigrationOptions { InputPath = SamplePath, OutputPath = _output }, TextWriter.Null);
     }
 

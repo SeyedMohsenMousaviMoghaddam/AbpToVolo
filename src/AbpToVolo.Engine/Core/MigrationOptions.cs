@@ -1,5 +1,15 @@
 namespace AbpToVolo.Core;
 
+/// <summary>Key types of the application's references to Module Zero users / roles / organization units.</summary>
+public enum IdTypeMode
+{
+    /// <summary>Keep the source types (long/int), linked to the ABP.io entities through their LegacyId.</summary>
+    Source,
+
+    /// <summary>Convert them to Guid, the key type of the ABP.io entities (data converted through Zero_IdMap).</summary>
+    Guid
+}
+
 public enum MigrationsMode
 {
     /// <summary>Merge all migrations into one that keeps the id of the last one (existing databases stay valid).</summary>
@@ -65,6 +75,22 @@ public sealed class MigrationOptions
 
     /// <summary>Run "dotnet build" on the converted solution and add the errors to the report.</summary>
     public bool Build { get; init; }
+
+    /// <summary>
+    /// Key types of the application's references to users, roles and organization units (UserId, RoleId...).
+    /// Source (default): they keep the source type (long/int) and point to the ABP.io entities through LegacyId.
+    /// Guid: they become Guid like the ABP.io keys. The ABP.io module fields (TenantId, CreatorId...) are Guid in both.
+    /// </summary>
+    public IdTypeMode IdType { get; init; } = IdTypeMode.Source;
+
+    /// <summary>ConnectionStrings:Default of the converted host and DbMigrator (null = the one of the source).</summary>
+    public string? ConnectionString { get; init; }
+
+    /// <summary>Run the converted DbMigrator after the conversion (migrates and seeds the configured database).</summary>
+    public bool MigrateDatabase { get; init; }
+
+    /// <summary>Start the converted host after the conversion and check that Swagger answers (then stop it).</summary>
+    public bool VerifyHost { get; init; }
 
     /// <summary>Delete the output folder first if it already exists.</summary>
     public bool Force { get; init; }

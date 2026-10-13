@@ -144,7 +144,7 @@ public sealed class TypeNameRewriter : MigrationRewriter
     private TypeSyntax? GuidId(string name, TypeSyntax type)
     {
         var text = SyntaxHelpers.Text(type);
-        if (ZeroMappings.GuidIdKind(name, text) is not { } kind) return null;
+        if (ZeroMappings.GuidIdKind(name, text, Context.IdType) is not { } kind) return null;
 
         Context.RequireUsing("System");
         Context.Change($"{name}: {text} → Guid{(text.EndsWith('?') ? "?" : "")} (ABP.io {kind} ids are Guid)");

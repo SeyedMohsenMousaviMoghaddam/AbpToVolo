@@ -29,7 +29,7 @@ public sealed class EndToEndTests : IDisposable
     {
         var steps = MigrationEngine.DefaultSteps()
             .Select(s => s is ResolveVersionsStep ? new ResolveVersionsStep(_ => null) : s)
-            .Where(s => s is not (BuildVerificationStep or BuildFixStep));
+            .Where(s => s is not (BuildVerificationStep or BuildFixStep or AbpIoModulesMigrationStep));
         var options = new MigrationOptions
         {
             InputPath = SamplePath,

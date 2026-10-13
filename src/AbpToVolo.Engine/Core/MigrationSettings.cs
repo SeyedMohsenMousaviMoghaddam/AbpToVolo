@@ -30,9 +30,17 @@ public sealed class MigrationSettings
     public bool CreateContracts { get; set; } = true;
     public bool CreateTests { get; set; } = true;
     public MigrationsMode Migrations { get; set; } = MigrationsMode.Squash;
+    public IdTypeMode IdType { get; set; } = IdTypeMode.Source;
     public bool CompilerFixes { get; set; } = true;
     public bool StubUnresolved { get; set; }
     public bool Build { get; set; }
+
+    /// <summary>Not saved with the settings (it usually contains a password).</summary>
+    [JsonIgnore]
+    public string? ConnectionString { get; set; }
+
+    public bool MigrateDatabase { get; set; }
+    public bool VerifyHost { get; set; }
     public bool Force { get; set; }
     public bool Verbose { get; set; }
 
@@ -50,9 +58,13 @@ public sealed class MigrationSettings
         CreateContracts = CreateContracts,
         CreateTests = CreateTests,
         Migrations = Migrations,
+        IdType = IdType,
         CompilerFixes = CompilerFixes,
         StubUnresolved = StubUnresolved,
         Build = Build,
+        ConnectionString = string.IsNullOrWhiteSpace(ConnectionString) ? Environment.GetEnvironmentVariable("ABPTOVOLO_CONNECTION_STRING") : ConnectionString,
+        MigrateDatabase = MigrateDatabase,
+        VerifyHost = VerifyHost,
         Force = Force,
         Verbose = Verbose
     };

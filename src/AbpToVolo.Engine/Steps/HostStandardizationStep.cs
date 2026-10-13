@@ -1,9 +1,11 @@
 using System.Security.Cryptography;
+using System.Text.RegularExpressions;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using AbpToVolo.CodeMigration;
 using AbpToVolo.Core;
 using AbpToVolo.Mappings;
+using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 
@@ -39,8 +41,11 @@ public sealed class HostStandardizationStep : IMigrationStep
 
         public bool SignalR { get; init; }
 
-        /// <summary>endpoints.MapHub&lt;THub&gt;("/route") calls of the old Startup (hub types fully qualified).</summary>
-        public List<string> Hubs { get; init; } = [];
+        /// <summary>endpoints.MapHub&lt;THub&gt;("/route") of the old Startup: hub type (fully qualified) and argument list.</summary>
+        public List<(string Hub, string Arguments)> Hubs { get; init; } = [];
+
+        /// <summary>ABP.io's SignalR module is used: it maps every hub itself, routes are set with AbpSignalROptions.</summary>
+        public bool AbpSignalR { get; init; }
     }
 
     public void Execute(MigrationContext context)
@@ -88,7 +93,7 @@ public sealed class HostStandardizationStep : IMigrationStep
     {
         var carried = new List<string>();
         var moved = new List<string>();
-        var hubs = new List<string>();
+        var hubs = new List<(string Hub, string Arguments)>();
         var signalR = false;
         string? customModule = null;
         var legacyFolder = Path.DirectorySeparatorChar + FileSystem.LegacyFolder + Path.DirectorySeparatorChar;
@@ -129,7 +134,12 @@ public sealed class HostStandardizationStep : IMigrationStep
         }
 
         if (customModule is not null) modules = modules with { HostCustom = customModule };
-        if (signalR || hubs.Count > 0) modules = modules with { SignalR = true, Hubs = hubs };
+        if (signalR || hubs.Count > 0)
+        {
+            // ABP.io's SignalR module maps every hub itself (route /signalr-hubs/{name}): mapping them again fails.
+            var abpSignalR = UsesAbpModule(context, "AbpAspNetCoreSignalRModule", "Volo.Abp.AspNetCore.SignalR", "Abp.AspNetCore.SignalR");
+            modules = modules with { SignalR = true, Hubs = hubs, AbpSignalR = abpSignalR };
+        }
 
         if (moved.Count > 0)
         {
@@ -142,6 +152,27 @@ public sealed class HostStandardizationStep : IMigrationStep
         var scope = prefix;
         FileSystem.WriteText(Path.Combine(host.Directory, moduleClass + ".cs"), HostModule(ns, moduleClass, scope, modules, context.UsesIdentityModules, carried));
         FileSystem.WriteText(Path.Combine(host.Directory, "Program.cs"), HostProgram(ns, moduleClass));
+
+        // ABP.io template: the client libraries of the MVC UI are restored with "abp install-libs" from this package.json.
+        var packageJson = Path.Combine(host.Directory, "package.json");
+        if (!File.Exists(packageJson))
+        {
+            var name = new string(prefix.ToLowerInvariant().Select(c => char.IsLetterOrDigit(c) ? c : '-').ToArray()).Trim('-');
+            FileSystem.WriteText(packageJson, $$"""
+                {
+                  "version": "1.0.0",
+                  "name": "{{name}}-host",
+                  "private": true,
+                  "dependencies": {
+                    "@abp/aspnetcore.mvc.ui.theme.basic": "~{{context.Options.AbpVersion}}"
+                  }
+                }
+
+                """);
+        }
+
+        context.Report.Todo(Name, "Swagger and the API work at once; for the login/account pages run 'abp install-libs' in the host folder (needs Node.js), " +
+                                  "then remove the AbpMvcLibsOptions.CheckLibs = false line of the host module.", context.Relative(host.CsprojPath));
 
         foreach (var (package, version) in SerilogHostPackages)
         {
@@ -156,6 +187,17 @@ public sealed class HostStandardizationStep : IMigrationStep
 
         context.State.StringEncryptionPassPhrase ??= Convert.ToHexString(RandomNumberGenerator.GetBytes(8));
         MergeHostSettings(settings, scope, context.UsesIdentityModules, context.State.StringEncryptionPassPhrase);
+        if (UsesAbpModule(context, "AbpCachingStackExchangeRedisModule", "Volo.Abp.Caching.StackExchangeRedis", "Abp.RedisCache"))
+        {
+            MergeRedisSettings(context, host, settings);
+        }
+
+        if (context.Options.ConnectionString is { } connectionString)
+        {
+            Section(settings, "ConnectionStrings")["Default"] = connectionString;
+            context.Report.Change(Name, "ConnectionStrings:Default set from --connection-string", context.Relative(host.CsprojPath));
+        }
+
         WriteSettings(Path.Combine(host.Directory, "appsettings.json"), settings);
 
         context.Report.Change(Name, $"Generated {moduleClass} and Program.cs (ABP.io HttpApi.Host template)", context.Relative(host.CsprojPath));
@@ -214,16 +256,41 @@ public sealed class HostStandardizationStep : IMigrationStep
         }
 
         var nl = Environment.NewLine;
-        var carriedBlock = (modules.SignalR ? $"{nl}        // SignalR hubs of the old Startup (their routes are mapped in OnApplicationInitialization){nl}        context.Services.AddSignalR();{nl}" : "") +
+        var hubs = modules.Hubs.Distinct().ToList();
+        string signalRBlock;
+        if (!modules.SignalR)
+        {
+            signalRBlock = "";
+        }
+        else if (modules.AbpSignalR)
+        {
+            // AbpAspNetCoreSignalRModule registers SignalR and maps the hubs: only their original routes are configured.
+            usings.Add("Volo.Abp.AspNetCore.SignalR");
+            signalRBlock = $"{nl}        // SignalR hubs keep the routes of the old Startup (ABP.io's SignalR module maps them).{nl}" +
+                           $"        Configure<AbpSignalROptions>(options =>{nl}        {{{nl}" +
+                           string.Concat(hubs.Select(h => $"            options.Hubs.AddOrUpdate(typeof({h.Hub}), config => config.RoutePattern = {HubRoute(h.Arguments)});{nl}")) +
+                           $"        }});{nl}";
+        }
+        else
+        {
+            signalRBlock = $"{nl}        // SignalR hubs of the old Startup (their routes are mapped in OnApplicationInitialization){nl}        context.Services.AddSignalR();{nl}";
+        }
+
+        // The MVC UI (Basic theme, Account login pages) needs the client libraries ("abp install-libs", npm); without them ABP
+        // blocks every page, Swagger included. The API works without them, so the check is off until they are installed.
+        usings.Add("Volo.Abp.AspNetCore.Mvc.Libs");
+        var libsBlock = $"{nl}        // Run \"abp install-libs\" in this folder for the login pages (Account module), then remove this line.{nl}" +
+                        $"        Configure<AbpMvcLibsOptions>(options => options.CheckLibs = false);{nl}";
+
+        var carriedBlock = libsBlock + signalRBlock +
                            (carried.Count == 0
                                ? ""
                                : nl + "        // TODO [AbpToVolo]: custom registrations of the old Startup.ConfigureServices/Configure (port the ones you need):" + nl +
                                  string.Concat(carried.SelectMany(c => c.Split('\n')).Select(l => $"        // {l.TrimEnd('\r')}{nl}")));
 
-        var endpoints = modules.Hubs.Count == 0
+        var endpoints = hubs.Count == 0 || modules.AbpSignalR
             ? "app.UseConfiguredEndpoints();"
-            : $"app.UseConfiguredEndpoints(endpoints =>{nl}        {{{nl}" + string.Concat(modules.Hubs.Distinct().Select(h => $"            {h};{nl}")) + "        });";
-        if (modules.Hubs.Count > 0) usings.Add("Microsoft.AspNetCore.Builder");
+            : $"app.UseConfiguredEndpoints(endpoints =>{nl}        {{{nl}" + string.Concat(hubs.Select(h => $"            endpoints.MapHub<{h.Hub}>{h.Arguments};{nl}")) + "        });";
 
         var swagger = identity
             ? $$"""
@@ -378,7 +445,7 @@ public sealed class HostStandardizationStep : IMigrationStep
     }
 
     /// <summary>endpoints.MapHub&lt;ChatHub&gt;("/chatHub") of the old Startup, hub types fully qualified (they keep their routes).</summary>
-    private static IEnumerable<string> MapHubCalls(MigrationContext context, ClassDeclarationSyntax startup)
+    private static IEnumerable<(string Hub, string Arguments)> MapHubCalls(MigrationContext context, ClassDeclarationSyntax startup)
     {
         var hubNamespaces = context.Projects.Where(p => p.Layer != ProjectLayer.Tests)
             .SelectMany(p => FileSystem.EnumerateFiles(p.Directory, "*.cs"))
@@ -393,8 +460,25 @@ public sealed class HostStandardizationStep : IMigrationStep
             if (call.Expression is not MemberAccessExpressionSyntax { Name: GenericNameSyntax { Identifier.Text: "MapHub", TypeArgumentList.Arguments.Count: 1 } name }) continue;
             var hub = SyntaxHelpers.SimpleName(name.TypeArgumentList.Arguments[0]);
             if (!hubNamespaces.TryGetValue(hub, out var ns)) continue; // Boilerplate's AbpCommonHub and other framework hubs
-            yield return $"endpoints.MapHub<{(ns is null ? hub : $"global::{ns}.{hub}")}>{call.ArgumentList}";
+            yield return (ns is null ? hub : $"global::{ns}.{hub}", call.ArgumentList.ToString());
         }
+    }
+
+    /// <summary>
+    /// Whether an ABP.io module is used. This step runs before the project files are converted, so the csproj may still
+    /// reference the Boilerplate package; the converted [DependsOn] already names the ABP.io module.
+    /// </summary>
+    private static bool UsesAbpModule(MigrationContext context, string module, params string[] packages) =>
+        context.Projects.Any(p =>
+            packages.Any(package => Regex.IsMatch(File.ReadAllText(p.CsprojPath), $@"Include=""{Regex.Escape(package)}""", RegexOptions.IgnoreCase)) ||
+            FileSystem.EnumerateFiles(p.Directory, "*.cs").Where(f => !context.IsExcluded(f))
+                .Any(f => File.ReadAllText(f).Contains($"typeof({module})", StringComparison.Ordinal)));
+
+    /// <summary>The route argument of MapHub("/route", options...) — the first argument.</summary>
+    private static string HubRoute(string arguments)
+    {
+        var list = SyntaxFactory.ParseArgumentList(arguments);
+        return list.Arguments.Count > 0 ? list.Arguments[0].ToString() : "\"/signalr\"";
     }
 
     private static string HostProgram(string ns, string moduleClass) => $$"""
@@ -484,6 +568,34 @@ public sealed class HostStandardizationStep : IMigrationStep
     private static void SetIfMissing(JsonObject section, string key, string value)
     {
         if (section[key] is null) section[key] = value;
+    }
+
+    /// <summary>
+    /// Boilerplate used Redis only when configured (Configuration.Caching.UseRedis with Abp:RedisCache:ConnectionString);
+    /// ABP.io's AbpCachingStackExchangeRedisModule uses Redis unless Redis:IsEnabled is false, and fails without
+    /// Redis:Configuration. The Boilerplate values are carried over; without a connection string Redis is disabled
+    /// (in-memory cache, as before).
+    /// </summary>
+    private void MergeRedisSettings(MigrationContext context, ProjectInfo host, JsonObject settings)
+    {
+        var redis = Section(settings, "Redis");
+        if (redis["Configuration"] is not null) return;
+
+        var boilerplate = (settings["Abp"] as JsonObject)?["RedisCache"] as JsonObject;
+        var connection = boilerplate?["ConnectionString"]?.GetValue<string>();
+        var database = boilerplate?["DatabaseId"]?.ToString();
+        if (string.IsNullOrWhiteSpace(connection))
+        {
+            redis["IsEnabled"] = "false";
+            redis["Configuration"] = "127.0.0.1";
+            context.Report.Change(Name, "Redis:IsEnabled = false (no Abp:RedisCache:ConnectionString: in-memory cache as in Boilerplate); " +
+                                        "set Redis:Configuration and Redis:IsEnabled = true to use Redis", context.Relative(host.CsprojPath));
+            return;
+        }
+
+        redis["IsEnabled"] = "true";
+        redis["Configuration"] = string.IsNullOrWhiteSpace(database) || database == "-1" ? connection : $"{connection},defaultDatabase={database}";
+        context.Report.Change(Name, "Redis:Configuration set from Abp:RedisCache:ConnectionString", context.Relative(host.CsprojPath));
     }
 
     /// <summary>Adds the ABP.io host settings, reusing the Boilerplate App:ServerRootAddress / ClientRootAddress / CorsOrigins.</summary>
@@ -617,6 +729,66 @@ public sealed class HostStandardizationStep : IMigrationStep
 
     // ---------- DbMigrator ----------
 
+    /// <summary>
+    /// "dotnet ef" design-time factory, ABP.io template style: the configuration comes from the DbMigrator's appsettings.json
+    /// (Boilerplate's AppConfigurations/WebContentDirectoryFinder looked for the old *.Web.Host folder), and the entity
+    /// extension mappings are configured first — otherwise "migrations add" would not see the extra properties of the
+    /// Identity entities and would drop their columns.
+    /// </summary>
+    private void StandardizeDesignTimeFactory(MigrationContext context, ProjectInfo efCore, ProjectInfo migrator, string prefix)
+    {
+        var file = FileSystem.EnumerateFiles(efCore.Directory, "*.cs")
+            .FirstOrDefault(f => !context.IsExcluded(f) && File.ReadAllText(f).Contains("IDesignTimeDbContextFactory<", StringComparison.Ordinal));
+        if (file is null) return;
+
+        var (code, encoding) = FileSystem.ReadText(file);
+        var root = CSharpSyntaxTree.ParseText(code).GetCompilationUnitRoot();
+        var create = root.DescendantNodes().OfType<MethodDeclarationSyntax>().FirstOrDefault(m => m.Identifier.Text == "CreateDbContext" && m.Body is not null);
+        if (create is null) return;
+
+        var configuration = create.Body!.Statements.OfType<LocalDeclarationStatementSyntax>()
+            .FirstOrDefault(s => s.Declaration.Variables.Count == 1 && s.Declaration.Variables[0].Identifier.Text == "configuration");
+        var mappings = $"{prefix}EfCoreEntityExtensionMappings";
+        var hasMappings = FileSystem.EnumerateFiles(efCore.Directory, "*.cs").Any(f => File.ReadAllText(f).Contains($"class {mappings}", StringComparison.Ordinal));
+        if (configuration is null && !hasMappings) return;
+
+        var cls = create.Ancestors().OfType<ClassDeclarationSyntax>().First();
+        var nl = code.Contains("\r\n", StringComparison.Ordinal) ? "\r\n" : "\n";
+        var migratorFolder = Path.GetFileName(migrator.Directory);
+        var updatedCreate = create;
+        if (configuration is not null)
+        {
+            var replacement = SyntaxFactory.ParseStatement("var configuration = BuildConfiguration();").WithTriviaFrom(configuration);
+            updatedCreate = updatedCreate.ReplaceNode(updatedCreate.Body!.Statements.First(s => s.IsEquivalentTo(configuration)), replacement);
+        }
+
+        if (hasMappings && !code.Contains($"{mappings}.Configure()", StringComparison.Ordinal))
+        {
+            var first = updatedCreate.Body!.Statements.First();
+            var call = SyntaxFactory.ParseStatement($"{mappings}.Configure();").WithLeadingTrivia(first.GetLeadingTrivia()).WithTrailingTrivia(SyntaxFactory.EndOfLine(nl));
+            updatedCreate = updatedCreate.WithBody(updatedCreate.Body.WithStatements(updatedCreate.Body.Statements.Insert(0, call)));
+        }
+
+        var updatedClass = cls.ReplaceNode(cls.Members.OfType<MethodDeclarationSyntax>().First(m => m.Identifier.Text == "CreateDbContext"), updatedCreate);
+        if (configuration is not null && !cls.Members.OfType<MethodDeclarationSyntax>().Any(m => m.Identifier.Text == "BuildConfiguration"))
+        {
+            var indent = SyntaxHelpers.Indentation(create);
+            var method = SyntaxFactory.ParseMemberDeclaration(
+                $"{nl}{indent}/* ABP.io template: the design-time configuration is the DbMigrator's appsettings.json (run \"dotnet ef\" in this project folder). */{nl}" +
+                $"{indent}private static IConfigurationRoot BuildConfiguration() =>{nl}" +
+                $"{indent}    new ConfigurationBuilder(){nl}" +
+                $"{indent}        .SetBasePath(Path.Combine(Directory.GetCurrentDirectory(), \"../{migratorFolder}/\")){nl}" +
+                $"{indent}        .AddJsonFile(\"appsettings.json\", optional: false){nl}" +
+                $"{indent}        .Build();{nl}")!;
+            updatedClass = updatedClass.AddMembers(method);
+        }
+
+        var result = ModuleMethodEditor.AddUsings(root.ReplaceNode(cls, updatedClass).ToFullString(), ["System.IO", "Microsoft.Extensions.Configuration"]);
+        FileSystem.WriteText(file, result, encoding);
+        context.Report.Change(Name, $"{cls.Identifier.Text}: design-time configuration from {migratorFolder}/appsettings.json" +
+                                    (hasMappings ? $", {mappings}.Configure() first" : ""), context.Relative(file));
+    }
+
     private void WriteDbMigration(MigrationContext context, ProjectInfo domain, ProjectInfo efCore, string prefix, Modules modules, JsonObject? hostSettings)
     {
         var identity = context.UsesIdentityModules;
@@ -658,10 +830,11 @@ public sealed class HostStandardizationStep : IMigrationStep
                 {
                     /* The DbContext is resolved from the service provider (not injected) so that the current tenant's
                      * connection string is used. */
-                    await _serviceProvider
-                        .GetRequiredService<{{modules.DbContext}}>()
-                        .Database
-                        .MigrateAsync();
+                    var dbContext = _serviceProvider.GetRequiredService<{{modules.DbContext}}>();
+
+                    /* Converting an existing database (ConvertModuleZeroKeys, data copy) can take longer than the default 30 s. */
+                    dbContext.Database.SetCommandTimeout(TimeSpan.FromMinutes(30));
+                    await dbContext.Database.MigrateAsync();
                 }
             }
 
@@ -707,6 +880,8 @@ public sealed class HostStandardizationStep : IMigrationStep
                 ProjectWriter.AddProjectReference(migrator.CsprojPath, reference.CsprojPath);
             }
         }
+
+        StandardizeDesignTimeFactory(context, efCore, migrator, prefix);
 
         var migratorNs = migrator.RootNamespace;
         var moduleClass = $"{prefix}DbMigratorModule";
@@ -829,6 +1004,17 @@ public sealed class HostStandardizationStep : IMigrationStep
         if (settings["ConnectionStrings"] is null && hostSettings?["ConnectionStrings"] is JsonObject connectionStrings)
         {
             settings["ConnectionStrings"] = connectionStrings.DeepClone();
+        }
+
+        if (context.Options.ConnectionString is { } connectionString)
+        {
+            Section(settings, "ConnectionStrings")["Default"] = connectionString;
+        }
+        else if (settings["ConnectionStrings"]?["Default"]?.ToString() is { } migratorDb && hostSettings?["ConnectionStrings"]?["Default"]?.ToString() is { } hostDb &&
+                 !string.Equals(migratorDb, hostDb, StringComparison.Ordinal))
+        {
+            context.Report.Warning(Name, $"The connection strings of {migrator.Name} and the host differ (the DbMigrator migrates its own one); " +
+                                         "use --connection-string to set both.", context.Relative(settingsPath));
         }
 
         if (identity && hostSettings is not null)
