@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/AbpToVolo.Desktop/AbpToVolo.Desktop.csproj" />
+    <Project Path="src/AbpToVolo.Engine/AbpToVolo.Engine.csproj" />
+    <Project Path="src/AbpToVolo/AbpToVolo.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/AbpToVolo.Tests/AbpToVolo.Tests.csproj" />
+  </Folder>
+</Solution>

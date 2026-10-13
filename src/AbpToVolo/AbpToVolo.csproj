@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>AbpToVolo</RootNamespace>
+
+    <!-- dotnet tool packaging: dotnet pack -> dotnet tool install -g -->
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>abp-to-volo</ToolCommandName>
+    <PackageId>AbpToVolo</PackageId>
+    <Version>2.0.0</Version>
+    <Description>Converts an ASP.NET Boilerplate (Abp.*) solution into an ABP Framework (Volo.Abp.*, abp.io) solution.</Description>
+    <PackageProjectUrl>https://github.com/SeyedMohsenMousaviMoghaddam/AbpToVolo</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/SeyedMohsenMousaviMoghaddam/AbpToVolo</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\AbpToVolo.Engine\AbpToVolo.Engine.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="AbpToVolo.Tests" />
+  </ItemGroup>
+
+</Project>

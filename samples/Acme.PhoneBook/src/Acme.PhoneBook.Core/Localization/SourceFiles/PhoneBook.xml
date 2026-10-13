@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<localizationDictionary culture="en">
+  <texts>
+    <text name="People" value="People" />
+    <text name="CreatingNewPerson" value="Creating new person" />
+    <text name="Tenants" value="Tenants" />
+    <text name="PersonNotFound" value="Person not found!" />
+    <text name="PhoneNotFound" value="Phone {0} not found!" />
+    <text name="LoginRequired" value="Please log in." />
+  </texts>
+</localizationDictionary>

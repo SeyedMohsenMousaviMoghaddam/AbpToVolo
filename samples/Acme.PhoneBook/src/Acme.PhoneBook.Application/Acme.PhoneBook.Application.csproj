@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>Acme.PhoneBook.Application</AssemblyName>
+    <PackageId>Acme.PhoneBook.Application</PackageId>
+    <RootNamespace>Acme.PhoneBook</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Acme.PhoneBook.Core\Acme.PhoneBook.Core.csproj" />
+  </ItemGroup>
+</Project>

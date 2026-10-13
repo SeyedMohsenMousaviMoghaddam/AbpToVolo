@@ -55,3 +55,11 @@ CodeCoverage/
 *.VisualState.xml
 TestResult.xml
 nunit-*.xml
+
+# IDEs
+.vs/
+.idea/
+*.user
+
+# dotnet pack output
+nupkg/

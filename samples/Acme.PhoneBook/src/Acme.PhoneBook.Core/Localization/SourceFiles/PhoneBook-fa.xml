@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<localizationDictionary culture="fa">
+  <texts>
+    <text name="People" value="اشخاص" />
+    <text name="CreatingNewPerson" value="ایجاد شخص جدید" />
+    <text name="Tenants" value="مستأجرها" />
+    <text name="PersonNotFound" value="شخص پیدا نشد!" />
+    <text name="PhoneNotFound" value="تلفن {0} پیدا نشد!" />
+    <text name="LoginRequired" value="لطفاً وارد شوید." />
+  </texts>
+</localizationDictionary>

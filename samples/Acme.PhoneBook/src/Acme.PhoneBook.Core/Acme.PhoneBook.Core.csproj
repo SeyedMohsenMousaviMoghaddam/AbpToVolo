@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>Acme.PhoneBook.Core</AssemblyName>
+    <PackageId>Acme.PhoneBook.Core</PackageId>
+    <RootNamespace>Acme.PhoneBook</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="Localization\SourceFiles\*.xml" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Abp" Version="9.4.2" />
+    <PackageReference Include="Abp.AutoMapper" Version="9.4.2" />
+    <PackageReference Include="Abp.ZeroCore" Version="9.4.2" />
+    <PackageReference Include="Castle.Windsor.MsDependencyInjection" Version="4.1.0" />
+  </ItemGroup>
+</Project>

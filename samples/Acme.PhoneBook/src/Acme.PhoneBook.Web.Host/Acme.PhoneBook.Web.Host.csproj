@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>Acme.PhoneBook.Web.Host</AssemblyName>
+    <OutputType>Exe</OutputType>
+    <PackageId>Acme.PhoneBook.Web.Host</PackageId>
+    <RootNamespace>Acme.PhoneBook.Web.Host</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Acme.PhoneBook.Web.Core\Acme.PhoneBook.Web.Core.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Abp.Castle.Log4Net" Version="9.4.2" />
+    <PackageReference Include="Castle.Windsor.MsDependencyInjection" Version="4.1.0" />
+  </ItemGroup>
+</Project>
