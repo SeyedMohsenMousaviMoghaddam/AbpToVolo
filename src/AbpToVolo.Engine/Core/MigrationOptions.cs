@@ -10,6 +10,19 @@ public enum IdTypeMode
     Guid
 }
 
+/// <summary>HTTP API of the converted application services.</summary>
+public enum ApiStyleMode
+{
+    /// <summary>
+    /// Same API as the source (default): /api/services/app/{Service}/{Method} routes, Boilerplate HTTP verbs and the
+    /// AjaxResponse envelope ({ result, success, error, unAuthorizedRequest, __abp }), so existing clients keep working.
+    /// </summary>
+    Boilerplate,
+
+    /// <summary>ABP.io conventions: /api/app/{service}/{id}, results not wrapped.</summary>
+    Abp
+}
+
 public enum MigrationsMode
 {
     /// <summary>Merge all migrations into one that keeps the id of the last one (existing databases stay valid).</summary>
@@ -82,6 +95,9 @@ public sealed class MigrationOptions
     /// Guid: they become Guid like the ABP.io keys. The ABP.io module fields (TenantId, CreatorId...) are Guid in both.
     /// </summary>
     public IdTypeMode IdType { get; init; } = IdTypeMode.Source;
+
+    /// <summary>HTTP API of the converted application services and controllers (default: same as the source).</summary>
+    public ApiStyleMode ApiStyle { get; init; } = ApiStyleMode.Boilerplate;
 
     /// <summary>ConnectionStrings:Default of the converted host and DbMigrator (null = the one of the source).</summary>
     public string? ConnectionString { get; init; }

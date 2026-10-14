@@ -33,6 +33,9 @@ public sealed class FileMigrationContext
     /// <summary>Key types of the references to Module Zero users/roles/organization units (see MigrationOptions.IdType).</summary>
     public IdTypeMode IdType { get; init; } = IdTypeMode.Source;
 
+    /// <summary>HTTP API style (see MigrationOptions.ApiStyle): Boilerplate keeps [DontWrapResult]/[WrapResult] (compatibility attributes).</summary>
+    public ApiStyleMode ApiStyle { get; init; } = ApiStyleMode.Boilerplate;
+
     public void RequireUsing(string? ns)
     {
         if (!string.IsNullOrWhiteSpace(ns)) RequiredUsings.Add(ns);

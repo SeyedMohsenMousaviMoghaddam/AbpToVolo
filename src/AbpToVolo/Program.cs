@@ -36,6 +36,9 @@ public static class Program
           --id-type <type>           source (default): the application's user/role/organization unit references keep the
                                      source key type (long/int), linked to the ABP.io entities through LegacyId;
                                      guid: convert them to Guid. TenantId and the audit fields are Guid in both (ABP.io standard)
+          --api-style <style>        boilerplate (default): same HTTP API as the source (/api/services/app/{Service}/{Method},
+                                     AjaxResponse envelope), so the existing front end keeps working;
+                                     abp: ABP.io conventions (/api/app/{service}, results not wrapped)
           --connection-string <cs>   ConnectionStrings:Default of the converted host and DbMigrator (default: the source's;
                                      or set ABPTOVOLO_CONNECTION_STRING). Not saved with --save-config.
           --migrate-database         Run the converted DbMigrator on that database (CHANGES THE DATABASE: use a copy)
@@ -175,6 +178,12 @@ public static class Program
                     settings.IdType = Enum.TryParse<IdTypeMode>(idType, ignoreCase: true, out var parsedIdType)
                         ? parsedIdType
                         : throw new ArgumentException($"Unknown id type '{idType}' (source, guid)");
+                    break;
+                case "--api-style":
+                    var apiStyle = Value();
+                    settings.ApiStyle = Enum.TryParse<ApiStyleMode>(apiStyle, ignoreCase: true, out var parsedApiStyle)
+                        ? parsedApiStyle
+                        : throw new ArgumentException($"Unknown API style '{apiStyle}' (boilerplate, abp)");
                     break;
                 case "--migrate-database": settings.MigrateDatabase = true; break;
                 case "--verify-host": settings.VerifyHost = true; break;

@@ -35,7 +35,7 @@ public sealed class ModuleZeroStep : IMigrationStep
         public string ConstsClass => Symbol.Name + "Consts";
     }
 
-    private sealed record ExtensionProperty(string Name, string Type, string? MaxLength, bool Required);
+    private sealed record ExtensionProperty(string Name, string Type, string? MaxLength, bool Required, string? Default = null);
 
     public string Name => "Module Zero → ABP.io modules";
 
@@ -64,6 +64,7 @@ public sealed class ModuleZeroStep : IMigrationStep
         foreach (var zero in zeroClasses.Where(z => ZeroMappings.IsEntity(z.Kind)))
         {
             CollectMembers(zero, model);
+            AddMissingBaseProperties(zero);
             if (zero.Replacement is { } replacement && zero.Properties.Count > 0)
             {
                 context.ExtensionProperties[replacement.Name] = zero.Properties.ToDictionary(p => p.Name, p => p.Type, StringComparer.Ordinal);
@@ -144,6 +145,20 @@ public sealed class ModuleZeroStep : IMigrationStep
         return result;
     }
 
+    /// <summary>
+    /// Members of the Module Zero base classes that the ABP.io entity does not have (Tenant.IsActive): they become entity
+    /// extensions mapped to the same column, so the code and the data keep them.
+    /// </summary>
+    private static void AddMissingBaseProperties(ZeroClass zero)
+    {
+        if (!ZeroMappings.MissingBaseProperties.TryGetValue(zero.Kind, out var missing)) return;
+        foreach (var (name, type, defaultValue) in missing)
+        {
+            if (zero.Properties.Any(p => p.Name == name)) continue;
+            zero.Properties.Add(new ExtensionProperty(name, type, null, false, defaultValue));
+        }
+    }
+
     private static void CollectMembers(ZeroClass zero, SolutionModel model)
     {
         foreach (var member in zero.Symbol.GetMembers())
@@ -219,7 +234,7 @@ public sealed class ModuleZeroStep : IMigrationStep
             if (legacy.ContainsKey(file)) continue;
             var root = tree.GetRoot();
 
-            if (IsProtected(root)) continue;
+            if (IsProtected(root) || ZeroMappings.HasEndpointType(root)) continue;
 
             var template = root.DescendantNodes().OfType<BaseTypeDeclarationSyntax>()
                 .Where(t => ZeroMappings.IsTemplateClass(t.Identifier.Text,
@@ -258,7 +273,7 @@ public sealed class ModuleZeroStep : IMigrationStep
 
             foreach (var (tree, file) in model.FileOf)
             {
-                if (legacy.ContainsKey(file) || IsProtected(tree.GetRoot())) continue;
+                if (legacy.ContainsKey(file) || IsProtected(tree.GetRoot()) || ZeroMappings.HasEndpointType(tree.GetRoot())) continue;
                 var semantic = model.Model(tree);
                 var dependency = tree.GetRoot().DescendantNodes().OfType<SimpleNameSyntax>()
                     .Where(n => legacyNames.Contains(n.Identifier.Text))
@@ -568,7 +583,8 @@ public sealed class ModuleZeroStep : IMigrationStep
                 sb.AppendLine("                    {");
                 foreach (var property in zero.Properties)
                 {
-                    sb.AppendLine($"                        {variable}.AddOrUpdateProperty<{property.Type}>(\"{property.Name}\");");
+                    var options = property.Default is null ? "" : $", property => property.DefaultValue = {property.Default}";
+                    sb.AppendLine($"                        {variable}.AddOrUpdateProperty<{property.Type}>(\"{property.Name}\"{options});");
                 }
 
                 sb.AppendLine("                    });");
@@ -585,6 +601,7 @@ public sealed class ModuleZeroStep : IMigrationStep
 
         sb.Clear();
         sb.AppendLine("using System;");
+        sb.AppendLine("using Microsoft.EntityFrameworkCore;");
         sb.AppendLine("using Volo.Abp.Identity;");
         sb.AppendLine("using Volo.Abp.ObjectExtending;");
         sb.AppendLine("using Volo.Abp.TenantManagement;");
@@ -610,6 +627,7 @@ public sealed class ModuleZeroStep : IMigrationStep
                 var build = new List<string>();
                 if (property.MaxLength is not null) build.Add($"propertyBuilder.HasMaxLength({QualifyConst(property.MaxLength, zero)});");
                 if (property.Required) build.Add("propertyBuilder.IsRequired();");
+                if (property.Default is not null) build.Add($"propertyBuilder.HasDefaultValue({property.Default});");
                 var lambda = build.Count == 0 ? "" : $", (entityBuilder, propertyBuilder) => {{ {string.Join(" ", build)} }}";
                 sb.AppendLine($"            ObjectExtensionManager.Instance.MapEfCoreProperty<{zero.Replacement!.Name}, {property.Type}>(\"{property.Name}\"{lambda});");
             }
@@ -825,8 +843,10 @@ public sealed class ModuleZeroStep : IMigrationStep
         public override SyntaxNode? VisitAnonymousObjectMemberDeclarator(AnonymousObjectMemberDeclaratorSyntax node)
         {
             var visited = (AnonymousObjectMemberDeclaratorSyntax)base.VisitAnonymousObjectMemberDeclarator(node)!;
-            return node.NameEquals is null && node.Expression is MemberAccessExpressionSyntax original && visited.Expression is not MemberAccessExpressionSyntax
-                ? visited.WithNameEquals(NameEquals(original.Name.Identifier.Text))
+            // Also a renamed member (new { u.EmailAddress } → new { EmailAddress = u.Email }): the code reads the old name.
+            return node.NameEquals is null && node.Expression is MemberAccessExpressionSyntax original &&
+                   (visited.Expression is not MemberAccessExpressionSyntax renamed || renamed.Name.Identifier.Text != original.Name.Identifier.Text)
+                ? SyntaxHelpers.NamedMember(visited, original.Name.Identifier.Text, visited.Expression)
                 : visited;
         }
 

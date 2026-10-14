@@ -9,6 +9,15 @@ public static class SyntaxHelpers
 {
     public const string TodoPrefix = "TODO [AbpToVolo]: ";
 
+    /// <summary>
+    /// new { x.A } → new { Name = value }, keeping the layout: the line break / indentation in front of the member moves to
+    /// the name, and " = " separates it from the value.
+    /// </summary>
+    public static AnonymousObjectMemberDeclaratorSyntax NamedMember(AnonymousObjectMemberDeclaratorSyntax declarator, string name, ExpressionSyntax value) =>
+        AnonymousObjectMemberDeclarator(
+            NameEquals(IdentifierName(name).WithLeadingTrivia(declarator.GetLeadingTrivia()), Token(SyntaxKind.EqualsToken).WithLeadingTrivia(Space).WithTrailingTrivia(Space)),
+            value.WithoutLeadingTrivia().WithTrailingTrivia(declarator.GetTrailingTrivia()));
+
     /// <summary>Name of a type without namespace qualification and generic arguments: Abp.Foo.Bar&lt;T&gt; → Bar.</summary>
     public static string SimpleName(TypeSyntax type) => type switch
     {

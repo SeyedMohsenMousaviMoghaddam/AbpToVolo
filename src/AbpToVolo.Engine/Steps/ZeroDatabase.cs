@@ -325,10 +325,13 @@ internal static class ZeroDatabase
         var restartSequences = legacyIds
             ? """
 
-                -- ---------- Legacy id sequences (new users and roles get the next numbers) ----------
-                DECLARE @restartLegacyIds nvarchar(400) =
+                -- ---------- Legacy id sequences (new users, roles and tenants get the next numbers) ----------
+                DECLARE @restartLegacyIds nvarchar(600) =
                     N'ALTER SEQUENCE dbo.AbpUserLegacyIds RESTART WITH ' + CAST(ISNULL((SELECT MAX(LegacyId) FROM dbo.[AbpUsers]), 0) + 1 AS nvarchar(30)) + N'; ' +
                     N'ALTER SEQUENCE dbo.AbpRoleLegacyIds RESTART WITH ' + CAST(ISNULL((SELECT MAX(LegacyId) FROM dbo.[AbpRoles]), 0) + 1 AS nvarchar(30)) + N';';
+                IF OBJECT_ID(N'dbo.AbpTenantLegacyIds', N'SO') IS NOT NULL
+                    SET @restartLegacyIds = @restartLegacyIds +
+                        N' ALTER SEQUENCE dbo.AbpTenantLegacyIds RESTART WITH ' + CAST(ISNULL((SELECT MAX(LegacyId) FROM dbo.[AbpTenants]), 0) + 1 AS nvarchar(30)) + N';';
                 EXEC sp_executesql @restartLegacyIds;
                 """
             : "";
@@ -363,9 +366,13 @@ internal static class ZeroDatabase
             SELECT N'Tenant', t.Id, NEWID() FROM dbo.[{T("AbpTenants")}] t
             WHERE NOT EXISTS (SELECT 1 FROM dbo.Zero_IdMap m WHERE m.EntityType = N'Tenant' AND m.OldId = t.Id);
 
-            INSERT INTO dbo.[AbpTenants] (Id, Name, NormalizedName, EntityVersion, IsDeleted, DeletionTime, LastModificationTime, CreationTime, ExtraProperties, ConcurrencyStamp{Columns(tenantExtensions)})
-            SELECT m.NewId, t.TenancyName, UPPER(t.TenancyName), 0, t.IsDeleted, t.DeletionTime, t.LastModificationTime, t.CreationTime, N'{EmptyJson}', LOWER(REPLACE(CONVERT(nvarchar(36), NEWID()), N'-', N'')){Values("t", tenantExtensions)}
+            INSERT INTO dbo.[AbpTenants] (Id, Name, NormalizedName, EntityVersion, IsDeleted, DeletionTime, LastModificationTime, CreationTime, ExtraProperties, ConcurrencyStamp{Columns(tenantExtensions)}{legacyColumn})
+            SELECT m.NewId, n.Name, UPPER(n.Name), 0, t.IsDeleted, t.DeletionTime, t.LastModificationTime, t.CreationTime, N'{EmptyJson}', LOWER(REPLACE(CONVERT(nvarchar(36), NEWID()), N'-', N'')){Values("t", tenantExtensions)}{LegacyValue("t")}
             FROM dbo.[{T("AbpTenants")}] t
+            -- Name = the Boilerplate display name (ABP.io: at most 64 characters, unique); TenancyName is kept as an extension.
+            CROSS APPLY (SELECT LEFT(COALESCE(NULLIF(LTRIM(RTRIM(t.Name)), N''), t.TenancyName), 64) AS DisplayName) d
+            CROSS APPLY (SELECT CASE WHEN EXISTS (SELECT 1 FROM dbo.[{T("AbpTenants")}] o WHERE o.Id <> t.Id AND
+                LEFT(COALESCE(NULLIF(LTRIM(RTRIM(o.Name)), N''), o.TenancyName), 64) = d.DisplayName) THEN LEFT(t.TenancyName, 64) ELSE d.DisplayName END AS Name) n
             JOIN dbo.Zero_IdMap m ON m.EntityType = N'Tenant' AND m.OldId = t.Id
             WHERE NOT EXISTS (SELECT 1 FROM dbo.[AbpTenants] x WHERE x.Id = m.NewId);
 

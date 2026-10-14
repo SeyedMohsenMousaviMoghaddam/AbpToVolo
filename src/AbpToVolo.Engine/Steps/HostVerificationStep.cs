@@ -70,10 +70,46 @@ public sealed partial class HostVerificationStep : IMigrationStep
             }
 
             context.Log.WriteLine(result.Ok ? $"    Swagger: OK ({result.Paths} API paths)" : $"    Swagger FAILED: {result.Summary}");
+            if (result.Swagger is not null && context.Options.ApiStyle == ApiStyleMode.Boilerplate) CheckEndpoints(context, result.Swagger);
         }
     }
 
-    private sealed record HostResult(bool Ok, int Paths, string Summary, List<string> Errors);
+    /// <summary>Every endpoint of the source must exist in the converted host (same path and verb): the clients keep working.</summary>
+    private void CheckEndpoints(MigrationContext context, string swagger)
+    {
+        EndpointParity.Result parity;
+        try
+        {
+            parity = EndpointParity.Compare(EndpointParity.SourceEndpoints(context.Options.InputPath), EndpointParity.SwaggerEndpoints(swagger));
+        }
+        catch (System.Text.Json.JsonException e)
+        {
+            context.Report.Warning(Name, $"Endpoint check skipped: swagger.json could not be read ({e.Message}).");
+            return;
+        }
+
+        var present = parity.Expected - parity.Missing.Count;
+        var lines = context.Report.Section("Endpoints of the source");
+        lines.Add($"{present} of the {parity.Expected} endpoints of the source answer at the same path in the converted host" +
+                  (parity.VerbChanged.Count > 0 ? $"; {parity.VerbChanged.Count} with another HTTP verb." : "."));
+        lines.AddRange(parity.Missing.Select(m => $"- **missing** `{m.Verb} {m.Path}` ({m.Source})"));
+        lines.AddRange(parity.VerbChanged.Select(v => $"- verb changed `{v.Source.Verb} {v.Source.Path}` → {v.ActualVerb} ({v.Source.Source})"));
+
+        context.Log.WriteLine($"    Endpoints: {present}/{parity.Expected} of the source present" +
+                              (parity.Missing.Count > 0 ? $", {parity.Missing.Count} missing" : "") +
+                              (parity.VerbChanged.Count > 0 ? $", {parity.VerbChanged.Count} with another verb" : ""));
+        foreach (var missing in parity.Missing)
+        {
+            context.Report.Todo(Name, $"Endpoint of the source missing in the converted host: {missing.Verb} {missing.Path}", missing.Source.Split(':')[0]);
+        }
+
+        if (parity.Missing.Count == 0 && parity.VerbChanged.Count == 0)
+        {
+            context.Report.Change(Name, $"All {parity.Expected} endpoints of the source answer at the same path and verb");
+        }
+    }
+
+    private sealed record HostResult(bool Ok, int Paths, string Summary, List<string> Errors, string? Swagger = null);
 
     private static HostResult VerifyHost(MigrationContext context, ProjectInfo host)
     {
@@ -126,7 +162,7 @@ public sealed partial class HostVerificationStep : IMigrationStep
             }
 
             var paths = SwaggerPath().Matches(body).Count;
-            return new HostResult(true, paths, "OK", []);
+            return new HostResult(true, paths, "OK", [], body);
         }
         finally
         {

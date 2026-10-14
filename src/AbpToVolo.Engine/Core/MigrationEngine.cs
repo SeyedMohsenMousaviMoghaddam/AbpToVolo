@@ -39,6 +39,7 @@ public sealed class MigrationEngine
         new LegacyIdStep(),            // --id-type source: LegacyId on IdentityUser/IdentityRole, principal keys, helpers
         new LayerServicesStep(),       // framework services each layer injects (HttpClient, SignalR)
         new HostStandardizationStep(), // ABP.io HttpApi.Host (module + Program.cs) and DbMigrator
+        new BoilerplateApiStep(),      // --api-style boilerplate: /api/services/app routes, AjaxResponse envelope
         new TestProjectsStep(),        // needs the final layout (interfaces in Application.Contracts)
         new CompatShimStep(),
         new ResolveVersionsStep(),

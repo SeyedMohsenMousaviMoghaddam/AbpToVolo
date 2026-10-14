@@ -29,7 +29,7 @@ public sealed class CSharpCodeStep : IMigrationStep
             }
 
             var project = context.FindProjectForFile(file);
-            var fileContext = new FileMigrationContext(file, FileSystem.DetectNewLine(code), project, context.PrimaryLocalization) { IdType = context.Options.IdType };
+            var fileContext = new FileMigrationContext(file, FileSystem.DetectNewLine(code), project, context.PrimaryLocalization) { IdType = context.Options.IdType, ApiStyle = context.Options.ApiStyle };
 
             CSharpMigrationResult result;
             try

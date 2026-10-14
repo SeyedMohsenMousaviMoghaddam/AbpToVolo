@@ -60,7 +60,8 @@ public class ModelRewriterTests : RewriterTestBase
         AssertContains("[Authorize(\"Pages.Users\")]", code);
         AssertContains("[Authorize] accepts a single policy", code);
         AssertContains("[AllowAnonymous]", code);
-        AssertNotContains("DontWrapResult", code);
+        AssertContains("[DontWrapResult]", code); // Boilerplate API style (default): compatibility attribute
+        AssertNotContains("DontWrapResult", Migrate(source, apiStyle: AbpToVolo.Core.ApiStyleMode.Abp).Code);
         AssertContains("[AutoMap(typeof(User)), AutoMap(typeof(Admin))]", code);
         AssertContains("[AutoMap(typeof(User), ReverseMap = true)]", code);
         AssertContains("using AutoMapper;", code);

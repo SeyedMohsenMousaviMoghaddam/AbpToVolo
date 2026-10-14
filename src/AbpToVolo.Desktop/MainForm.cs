@@ -20,6 +20,7 @@ public sealed class MainForm : Form
     private readonly ComboBox _framework = new() { Width = 90, DropDownStyle = ComboBoxStyle.DropDownList };
     private readonly ComboBox _migrations = new() { Width = 230, DropDownStyle = ComboBoxStyle.DropDownList };
     private readonly ComboBox _idType = new() { Width = 230, DropDownStyle = ComboBoxStyle.DropDownList };
+    private readonly ComboBox _apiStyle = new() { Width = 230, DropDownStyle = ComboBoxStyle.DropDownList };
     private readonly CheckBox _abpNames = Check("نام‌گذاری لایه‌ها و ماژول‌ها مطابق abp.io (Domain به‌جای Core، HttpApi، HttpApi.Host، DbMigrator)");
     private readonly CheckBox _zero = Check("جایگزینی Module Zero با ماژول‌های Volo (Identity، TenantManagement، Permission/Setting/Feature Management، Account، OpenIddict)");
     private readonly CheckBox _contracts = Check("ساخت ماژول‌های Contract (Domain.Shared و Application.Contracts)");
@@ -81,6 +82,7 @@ public sealed class MainForm : Form
         _framework.Items.AddRange(["net10.0", "net9.0", "net8.0"]);
         _migrations.Items.AddRange(["ادغام در یک migration با حفظ تاریخچه", "حذف migrationهای قدیمی", "بدون تغییر"]);
         _idType.Items.AddRange(["حفظ نوع مبدا (long/int) با LegacyId", "تبدیل به Guid (پیشنهاد ABP)"]);
+        _apiStyle.Items.AddRange(["همان API مبدا (/api/services/app، AjaxResponse)", "استاندارد ABP (/api/app)"]);
 
         foreach (var (title, width) in new[] { ("#", 40), ("مرحله", 240), ("وضعیت", 100), ("زمان", 70), ("تغییرات", 70), ("کار دستی", 80), ("هشدار", 60) })
         {
@@ -154,7 +156,8 @@ public sealed class MainForm : Form
         AddValueRow(values, 1, "Target framework:", _framework);
         AddValueRow(values, 2, "Migrationهای EF Core:", _migrations);
         AddValueRow(values, 3, "نوع کلید ارجاع به کاربر/نقش:", _idType);
-        AddValueRow(values, 4, "Connection string مقصد (اختیاری، ذخیره نمی‌شود):", _connectionString);
+        AddValueRow(values, 4, "سبک API (مسیرها و پاسخ‌ها):", _apiStyle);
+        AddValueRow(values, 5, "Connection string مقصد (اختیاری، ذخیره نمی‌شود):", _connectionString);
         options.Controls.Add(checks, 0, 0);
         options.Controls.Add(values, 1, 0);
         optionsBox.Controls.Add(options);
@@ -220,6 +223,7 @@ public sealed class MainForm : Form
         TargetFramework = _framework.SelectedItem as string ?? "net10.0",
         Migrations = _migrations.SelectedIndex switch { 1 => MigrationsMode.Delete, 2 => MigrationsMode.Keep, _ => MigrationsMode.Squash },
         IdType = _idType.SelectedIndex == 1 ? IdTypeMode.Guid : IdTypeMode.Source,
+        ApiStyle = _apiStyle.SelectedIndex == 1 ? ApiStyleMode.Abp : ApiStyleMode.Boilerplate,
         UseAbpLayerNames = _abpNames.Checked,
         ConvertModuleZero = _zero.Checked,
         CreateContracts = _contracts.Checked,
@@ -243,6 +247,7 @@ public sealed class MainForm : Form
         _framework.SelectedItem = _framework.Items.Contains(settings.TargetFramework) ? settings.TargetFramework : "net10.0";
         _migrations.SelectedIndex = settings.Migrations switch { MigrationsMode.Delete => 1, MigrationsMode.Keep => 2, _ => 0 };
         _idType.SelectedIndex = settings.IdType == IdTypeMode.Guid ? 1 : 0;
+        _apiStyle.SelectedIndex = settings.ApiStyle == ApiStyleMode.Abp ? 1 : 0;
         _abpNames.Checked = settings.UseAbpLayerNames;
         _zero.Checked = settings.ConvertModuleZero;
         _contracts.Checked = settings.CreateContracts;
@@ -369,7 +374,7 @@ public sealed class MainForm : Form
 
     private void SetRunning(bool running)
     {
-        foreach (Control control in new Control[] { _start, _source, _destination, _abpVersion, _framework, _migrations, _idType, _abpNames, _zero, _contracts, _tests, _host, _compilerFixes, _stubUnresolved, _build, _migrateDatabase, _verifyHost, _connectionString, _force, _verbose, _loadSettings })
+        foreach (Control control in new Control[] { _start, _source, _destination, _abpVersion, _framework, _migrations, _idType, _apiStyle, _abpNames, _zero, _contracts, _tests, _host, _compilerFixes, _stubUnresolved, _build, _migrateDatabase, _verifyHost, _connectionString, _force, _verbose, _loadSettings })
         {
             control.Enabled = !running;
         }

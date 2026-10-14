@@ -31,6 +31,7 @@ public sealed class MigrationSettings
     public bool CreateTests { get; set; } = true;
     public MigrationsMode Migrations { get; set; } = MigrationsMode.Squash;
     public IdTypeMode IdType { get; set; } = IdTypeMode.Source;
+    public ApiStyleMode ApiStyle { get; set; } = ApiStyleMode.Boilerplate;
     public bool CompilerFixes { get; set; } = true;
     public bool StubUnresolved { get; set; }
     public bool Build { get; set; }
@@ -59,6 +60,7 @@ public sealed class MigrationSettings
         CreateTests = CreateTests,
         Migrations = Migrations,
         IdType = IdType,
+        ApiStyle = ApiStyle,
         CompilerFixes = CompilerFixes,
         StubUnresolved = StubUnresolved,
         Build = Build,

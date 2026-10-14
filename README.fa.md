@@ -35,7 +35,8 @@
 | `--id-type source\|guid` | نوع کلید ارجاع‌های خود برنامه به کاربر/نقش (`UserId`، `RoleId`…). `source` (پیش‌فرض) نوع مبدا (long/int) را نگه می‌دارد و از طریق `LegacyId` به Entityهای ABP.io وصل می‌شود؛ `guid` آن‌ها را به Guid تبدیل می‌کند. فیلدهای ماژول‌های ABP.io (`TenantId`، `CreatorId`…) در هر دو حالت Guid هستند |
 | `--connection-string <cs>` | `ConnectionStrings:Default` برای Host و DbMigrator تبدیل‌شده (یا متغیر محیطی `ABPTOVOLO_CONNECTION_STRING`؛ در تنظیمات ذخیره نمی‌شود) |
 | `--migrate-database` | بعد از تبدیل، DbMigrator را اجرا می‌کند (**دیتابیس را تغییر می‌دهد؛ روی کپی اجرا کنید**) |
-| `--verify-host` | Host تبدیل‌شده را اجرا می‌کند، بالا آمدن Swagger را بررسی می‌کند و آن را می‌بندد؛ نتیجه در گزارش می‌آید |
+| `--verify-host` | Host تبدیل‌شده را اجرا می‌کند، بالا آمدن Swagger را بررسی می‌کند، endpointهایش را با مبدا مقایسه می‌کند و آن را می‌بندد؛ نتیجه در گزارش می‌آید |
+| `--api-style boilerplate\|abp` | `boilerplate` (پیش‌فرض): Host تبدیل‌شده همان API مبدا را دارد (مسیرهای `/api/services/app/{Service}/{Action}` و پوشش `AjaxResponse`) تا فرانت بدون تغییر کار کند؛ `abp`: قراردادهای ABP.io (`/api/app/{service}` و پاسخ بدون پوشش) |
 | `--build`، `--force`، `--verbose` | build نهایی و درج خطاها در گزارش، جایگزینی خروجی، لاگ کامل |
 
 خروجی: solution تبدیل‌شده + `ABP-MIGRATION-REPORT.md` (چک‌لیست کارهای دستی با شماره خط) + `abp-migration-report.json` + `abp-migration.log` (لاگ کامل همه مراحل).
@@ -135,6 +136,23 @@ git merge converted           # فقط تعارض‌های واقعی می‌م�
 | اتصال به `IdentityUser`/`IdentityRole` | خصوصیت و ستون `LegacyId` (شناسه قدیم؛ ردیف‌های جدید از sequence شماره می‌گیرند) و `HasPrincipalKey("LegacyId")` برای هر navigation با کلید long/int | کلید Guid |
 | کاربر جاری | `CurrentUser.GetLegacyId()` / `GetRequiredLegacyId()` (claim `legacy_user_id`) | `CurrentUser.Id` |
 | پیدا کردن کاربر با شناسه قدیم | `ILegacyIdLookup.FindUserAsync(long)` و `user.GetLegacyId()` | — |
+| شناسه تنانت در کد و API برنامه | مثل مبدا int است: `Tenant.LegacyId` (شناسه قدیم؛ تنانت‌های جدید از sequence شماره می‌گیرند). جایی که `tenant.Id` به‌عنوان int استفاده شده، در کوئری‌های EF Core به `EF.Property<int>(t, "LegacyId")` و در بقیه جاها به `tenant.GetLegacyId()` تبدیل می‌شود. `repository.DeleteAsync(intId)` به شرطی روی `LegacyId` تبدیل می‌شود. هدر یا کوکی `Abp.TenantId` کلاینت‌های Boilerplate، تنانتی را که همان `LegacyId` را دارد انتخاب می‌کند | Guid |
+
+تنانت‌ها: Boilerplate دو فیلد `TenancyName` (شناسه) و `Name` (نام نمایشی) دارد، ولی ABP.io فقط `Name` دارد. `Name` نام نمایشی را نگه می‌دارد (حداکثر ۶۴ کاراکتر؛ در صورت تکراری بودن، با tenancy name یکتا می‌شود). `TenancyName` و `IsActive` هم به‌صورت extension روی همان داده نگه داشته می‌شوند. پس `tenant.Name` و `tenant.TenancyName` در کد همان معنای قبلی را دارند.
+
+Extensionهایی که داخل کوئری‌های EF Core خوانده می‌شوند (`GetProperty`، `GetLegacyId()`) به SQL ترجمه نمی‌شوند. بعد از اینکه solution کامپایل شد، این موارد با کمک semantic model پروژه‌های تبدیل‌شده (با referenceهای واقعی‌شان) به `EF.Property<T>(x, "Name")` تبدیل می‌شوند.
+
+### API وب (`--api-style`)
+
+همه endpointهای مبدا با همان مسیر و همان HTTP verb باقی می‌مانند تا فرانت بدون تغییر کار کند:
+
+- Application Serviceها و Controllerها هیچ‌وقت به پوشه legacy منتقل نمی‌شوند، حتی کلاس‌های قالب (`UserAppService`، `TenantAppService`، `SessionAppService`، `TokenAuthController`…). هر بخشی که کامپایل نشود، عضو به عضو stub می‌شود: پارامتر سازنده یا فیلدی که resolve نشود حذف می‌شود، نوع ناشناخته در امضای متد به `object` تبدیل می‌شود و بدنه متد `NotImplementedException` می‌دهد. به این ترتیب مسیر وجود دارد و گزارش، کارهای باقی‌مانده را فهرست می‌کند.
+- حالت `boilerplate` (پیش‌فرض) کلاس `BoilerplateApi` را در پروژه HttpApi می‌سازد:
+  - جایگزینی برای `IConventionalRouteBuilder` که مسیرهای `/api/services/app/{Service}/{Action}` را با همان قواعد verb می‌سازد (`Get…` → GET، `Update…` → PUT، `Delete…` → DELETE و بقیه POST)؛
+  - یک result filter که نتیجه‌ها، خطاها (`RemoteServiceErrorResponse`) و پاسخ‌های 401/403 را به شکل `{ result, targetUrl, success, error, unAuthorizedRequest, __abp }` برمی‌گرداند.
+
+  `[DontWrapResult]` و `[WrapResult]` همچنان کار می‌کنند (نوع‌های سازگاری در Domain.Shared). endpointهای ماژول‌های ABP.io (`/api/abp/…`، `/api/identity/…`، `/connect/token`) تغییری نمی‌کنند.
+- `--verify-host` endpointهای مبدا (با قواعد Boilerplate) را با `swagger.json` تبدیل‌شده مقایسه می‌کند و endpointهای گم‌شده و verbهای تغییرکرده را در بخش «Endpoints of the source» گزارش فهرست می‌کند.
 
 ### Viewهای SQL
 

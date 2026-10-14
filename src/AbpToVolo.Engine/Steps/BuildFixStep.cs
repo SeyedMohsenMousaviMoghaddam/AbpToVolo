@@ -25,7 +25,7 @@ public sealed partial class BuildFixStep : IMigrationStep
     public const int MaxIterations = 10;
 
     /// <summary>With --stub-unresolved every stubbing round lets the build reach further projects, so more rounds are needed.</summary>
-    public const int MaxIterationsWithStubs = 25;
+    public const int MaxIterationsWithStubs = 30;
 
     private delegate SyntaxNode Fix(SyntaxNode node);
 
@@ -52,6 +52,7 @@ public sealed partial class BuildFixStep : IMigrationStep
         var stubbed = new List<string>();
         var maxIterations = context.Options.StubUnresolved ? MaxIterationsWithStubs : MaxIterations;
         var retries = 0;
+        var queriesFixed = false;
         for (var iteration = 1; iteration <= maxIterations; iteration++)
         {
             context.Progress(iteration - 1, maxIterations, $"build {iteration}");
@@ -78,10 +79,23 @@ public sealed partial class BuildFixStep : IMigrationStep
             if (lastErrors == 0)
             {
                 context.Log.WriteLine($"build {iteration}: no errors");
+                // Once everything compiles: extension properties read inside EF Core queries (compile, but fail at run time).
+                if (!queriesFixed)
+                {
+                    queriesFixed = true;
+                    var rewritten = FixExtensionPropertiesInQueries(context, totals);
+                    if (rewritten > 0)
+                    {
+                        context.Log.WriteLine($"build {iteration}: {rewritten} extension properties inside EF Core queries → EF.Property; building again");
+                        continue;
+                    }
+                }
+
                 break;
             }
 
             var applied = FixPackageDowngrades(context, result.OtherErrors, totals) + ApplyFixes(context, result.Errors, totals);
+            if (applied == 0) applied = ApplySemanticFixes(context, result.Errors, totals);
             var projects = string.Join(", ", result.Errors.GroupBy(e => e.Project).Select(g => $"{g.Key}: {g.Count()}"));
             context.Log.WriteLine($"build {iteration}: {lastErrors} errors ({projects}) → {applied} fixed");
             if (applied == 0 && context.Options.StubUnresolved && result.Errors.Count > 0)
@@ -131,6 +145,7 @@ public sealed partial class BuildFixStep : IMigrationStep
 
             var bodies = new Dictionary<SyntaxNode, BuildDiagnostic>();
             BuildDiagnostic? declarationError = null;
+            var declarationErrors = new List<BuildDiagnostic>();
             foreach (var error in group)
             {
                 if (error.Line < 1 || error.Line > text.Lines.Count) continue;
@@ -145,14 +160,30 @@ public sealed partial class BuildFixStep : IMigrationStep
                     PropertyDeclarationSyntax p => p.ExpressionBody,
                     _ => null
                 };
-                if (body is not null && body.Span.Contains(token.Span)) bodies.TryAdd(body, error);
-                else declarationError ??= error;
+                // Errors about the body reported on the member's name (CS0161 "not all code paths return a value",
+                // CS4032/CS1983/CS0127...) belong to the body too.
+                var onName = member is MethodDeclarationSyntax { Identifier: var identifier } && identifier == token ||
+                             member is ConstructorDeclarationSyntax { Identifier: var ctorIdentifier } && ctorIdentifier == token ||
+                             member is AccessorDeclarationSyntax { Keyword: var keyword } && keyword == token;
+                if (body is not null && (body.Span.Contains(token.Span) || onName)) bodies.TryAdd(body, error);
+                else
+                {
+                    declarationError ??= error;
+                    declarationErrors.Add(error);
+                }
             }
 
             // An error in a declaration (field type, base type, signature): the whole file is kept under #if, unless it is
-            // a module or the DbContext (the solution would not start without them).
+            // a module or the DbContext (the solution would not start without them). Endpoints (application services,
+            // controllers) are repaired declaration by declaration instead: their routes must stay.
             if (declarationError is not null)
             {
+                if (ZeroMappings.HasEndpointType(root) && RepairEndpointDeclarations(context, group.Key, code, encoding, root, text, declarationErrors, stubbed) is var repaired and > 0)
+                {
+                    count += repaired;
+                    continue;
+                }
+
                 var types = root.DescendantNodes().OfType<BaseTypeDeclarationSyntax>().Select(t => t.Identifier.Text).ToList();
                 if (types.Count == 0 || types.Any(t => t.EndsWith("Module", StringComparison.Ordinal) || t.EndsWith("DbContext", StringComparison.Ordinal))) continue;
 
@@ -171,6 +202,8 @@ public sealed partial class BuildFixStep : IMigrationStep
             if (bodies.Count == 0) continue;
 
             var newline = code.Contains("\r\n", StringComparison.Ordinal) ? "\r\n" : "\n";
+            var positions = group.Where(e => e.Line >= 1 && e.Line <= text.Lines.Count)
+                .Select(e => text.Lines[e.Line - 1].Start + Math.Max(0, e.Column - 1)).ToList();
             var result = code;
             foreach (var (body, error) in bodies.OrderByDescending(b => b.Key.SpanStart))
             {
@@ -210,6 +243,30 @@ public sealed partial class BuildFixStep : IMigrationStep
                     original = code[block.OpenBraceToken.Span.End..block.CloseBraceToken.SpanStart].Trim('\r', '\n');
                 }
 
+                // A constructor that throws would make the whole class unusable (a controller or application service loses
+                // every endpoint): only its statements that do not compile go under #if, the others stay.
+                if (member is ConstructorDeclarationSyntax && body is BlockSyntax ctorBody &&
+                    ctorBody.Statements.Where(s => positions.Any(p => s.Span.Contains(p))).ToList() is { Count: > 0 } failing &&
+                    failing.All(s => string.IsNullOrWhiteSpace(code[text.Lines.GetLineFromPosition(s.SpanStart).Start..s.SpanStart])))
+                {
+                    foreach (var statement in failing.OrderByDescending(s => s.SpanStart))
+                    {
+                        var lineStart = text.Lines.GetLineFromPosition(statement.SpanStart).Start;
+                        var end = statement.FullSpan.End;
+                        result = result[..lineStart] +
+                                 $"#if {OriginalCodeSymbol} // TODO [AbpToVolo]: did not compile after the conversion ({message.Replace(newline, " ")}); skipped until fixed.{newline}" +
+                                 result[lineStart..end].TrimEnd('\r', '\n') + newline + $"#endif{newline}" +
+                                 result[end..];
+                    }
+
+                    var ctorLocation = $"{context.Relative(group.Key)}:{text.Lines.GetLinePosition(member.SpanStart).Line + 1}";
+                    stubbed.Add($"`{type}.{name}` ({ctorLocation}) [{failing.Count} statements skipped] — {message}");
+                    context.Report.Todo(Name, $"{type}.{name}: {failing.Count} statements did not compile ({message}) and are skipped (#if {OriginalCodeSymbol}); " +
+                                              "the members that use what they set throw or fail until they are fixed.", ctorLocation);
+                    count++;
+                    continue;
+                }
+
                 // Modules and DbContexts run at startup: a throwing stub would stop the whole application, so their
                 // members that return nothing become no-ops (reported as warnings) instead.
                 var startup = IsStartupCode(member);
@@ -243,6 +300,112 @@ public sealed partial class BuildFixStep : IMigrationStep
         }
 
         return count;
+    }
+
+    /// <summary>
+    /// Declaration errors of an endpoint file (application service, controller, their interfaces) without losing the
+    /// endpoints: a constructor parameter / field / property / attribute / base interface that does not compile is
+    /// removed (its uses then fail in member bodies, which are stubbed), and an unknown type in a method signature
+    /// becomes object, so the method — and its route — stays. Each removal is a comment in the code and a report item.
+    /// Returns the number of repaired declarations (0: nothing could be repaired, the whole file is excluded).
+    /// </summary>
+    private int RepairEndpointDeclarations(MigrationContext context, string file, string code, System.Text.Encoding encoding, SyntaxNode root,
+        SourceText text, List<BuildDiagnostic> errors, List<string> stubbed)
+    {
+        var removals = new Dictionary<SyntaxNode, BuildDiagnostic>();
+        var toObject = new Dictionary<SyntaxNode, BuildDiagnostic>();
+        foreach (var error in errors)
+        {
+            if (error.Line < 1 || error.Line > text.Lines.Count) continue;
+            var node = root.FindToken(text.Lines[error.Line - 1].Start + Math.Max(0, error.Column - 1)).Parent;
+            if (node is null) continue;
+            var path = node.AncestorsAndSelf().ToList();
+
+            if (path.OfType<UsingDirectiveSyntax>().FirstOrDefault() is { } usingDirective)
+            {
+                removals.TryAdd(usingDirective, error);
+            }
+            else if (path.OfType<AttributeSyntax>().FirstOrDefault() is { } attribute)
+            {
+                removals.TryAdd(attribute.Parent is AttributeListSyntax { Attributes.Count: 1 } list ? list : attribute, error);
+            }
+            else if (path.OfType<ParameterSyntax>().FirstOrDefault() is { Parent: ParameterListSyntax { Parent: TypeDeclarationSyntax or ConstructorDeclarationSyntax } } parameter)
+            {
+                removals.TryAdd(parameter, error);
+            }
+            else if (path.OfType<BaseTypeSyntax>().FirstOrDefault() is { Parent: BaseListSyntax } baseType)
+            {
+                removals.TryAdd(baseType, error);
+            }
+            else if (path.FirstOrDefault(n => n is FieldDeclarationSyntax or EventFieldDeclarationSyntax or PropertyDeclarationSyntax or EventDeclarationSyntax) is { } member &&
+                     path.OfType<AccessorListSyntax>().FirstOrDefault() is null && path.OfType<ArrowExpressionClauseSyntax>().FirstOrDefault() is null)
+            {
+                removals.TryAdd(member, error);
+            }
+            else if (path.FirstOrDefault(n => n is TypeSyntax && n.Parent is not (QualifiedNameSyntax or AliasQualifiedNameSyntax)) is TypeSyntax type &&
+                     path.Any(n => n is MethodDeclarationSyntax or DelegateDeclarationSyntax or ParameterListSyntax) &&
+                     !path.Any(n => n is BlockSyntax or ArrowExpressionClauseSyntax))
+            {
+                toObject.TryAdd(type, error);
+            }
+        }
+
+        // A removal inside another removed node is part of it.
+        foreach (var inner in removals.Keys.Where(n => removals.Keys.Any(o => o != n && o.Span.Contains(n.Span))).ToList()) removals.Remove(inner);
+        foreach (var inner in toObject.Keys.Where(n => removals.Keys.Any(o => o.Span.Contains(n.Span)) || toObject.Keys.Any(o => o != n && o.Span.Contains(n.Span))).ToList())
+        {
+            toObject.Remove(inner);
+        }
+
+        if (removals.Count + toObject.Count == 0) return 0;
+
+        var relative = context.Relative(file);
+        string Message(BuildDiagnostic e) => $"{e.Code}: {e.Message}".Replace("\r", " ").Replace("\n", " ").Replace("*/", "* /");
+        string Location(SyntaxNode n) => $"{relative}:{text.Lines.GetLinePosition(n.SpanStart).Line + 1}";
+
+        // Each removal leaves a comment on the declaration that contains it.
+        var notes = new Dictionary<SyntaxNode, List<string>>();
+        foreach (var (node, error) in removals)
+        {
+            var owner = node is UsingDirectiveSyntax ? node.Parent! :
+                node.Ancestors().FirstOrDefault(a => a is MemberDeclarationSyntax and not (FieldDeclarationSyntax or PropertyDeclarationSyntax or EventFieldDeclarationSyntax)) ?? node.Parent!;
+            if (node is MemberDeclarationSyntax && node.Parent is not null) owner = node.Parent;
+            if (!notes.TryGetValue(owner, out var list)) notes[owner] = list = [];
+            var removed = Regex.Replace(node.ToString(), @"\s+", " ");
+            list.Add($"removed `{removed}` ({Message(error)})");
+            stubbed.Add($"`{removed}` removed from an endpoint ({Location(node)}) — {Message(error)}");
+            context.Report.Todo(Name, $"Endpoint kept: `{removed}` was removed because it did not compile ({Message(error)}); the members that used it throw NotImplementedException.", Location(node));
+        }
+
+        foreach (var (node, error) in toObject)
+        {
+            var owner = node.Ancestors().First(a => a is MemberDeclarationSyntax or DelegateDeclarationSyntax);
+            if (!notes.TryGetValue(owner, out var list)) notes[owner] = list = [];
+            list.Add($"type `{node}` → object ({Message(error)})");
+            stubbed.Add($"`{node}` → object in a signature ({Location(node)}) — {Message(error)}");
+            context.Report.Todo(Name, $"Endpoint kept: the type `{node}` of a signature did not compile ({Message(error)}) and became object; restore the type.", Location(node));
+        }
+
+        var tracked = root.TrackNodes(removals.Keys.Concat(toObject.Keys).Concat(notes.Keys));
+        foreach (var node in toObject.Keys)
+        {
+            var current = tracked.GetCurrentNode(node)!;
+            tracked = tracked.ReplaceNode(current, PredefinedType(Token(SyntaxKind.ObjectKeyword)).WithTriviaFrom(current));
+        }
+
+        var newline = code.Contains("\r\n", StringComparison.Ordinal) ? "\r\n" : "\n";
+        foreach (var (owner, list) in notes)
+        {
+            var current = tracked.GetCurrentNode(owner)!;
+            if (current is CompilationUnitSyntax or BaseNamespaceDeclarationSyntax) continue; // usings: the report is enough
+            var indent = current.GetLeadingTrivia().LastOrDefault(t => t.IsKind(SyntaxKind.WhitespaceTrivia)).ToString();
+            var comments = list.Select(l => $"// TODO [AbpToVolo]: {l}{newline}{indent}");
+            tracked = tracked.ReplaceNode(current, current.WithLeadingTrivia(current.GetLeadingTrivia().AddRange(ParseLeadingTrivia(string.Concat(comments)))));
+        }
+
+        tracked = tracked.RemoveNodes(removals.Keys.Select(n => tracked.GetCurrentNode(n)!), SyntaxRemoveOptions.KeepLeadingTrivia | SyntaxRemoveOptions.KeepUnbalancedDirectives)!;
+        FileSystem.WriteText(file, tracked.ToFullString(), encoding);
+        return removals.Count + toObject.Count;
     }
 
     /// <summary>
@@ -361,9 +524,36 @@ public sealed partial class BuildFixStep : IMigrationStep
             "CS1503" when ExceptionAsString().Match(error.Message) is { Success: true } m => PlanInnerException(token, int.Parse(m.Groups["index"].Value)),
             "CS0272" when InaccessibleSetter().Match(error.Message) is { Success: true } m =>
                 PlanSetter(context, token, Simple(m.Groups["type"].Value), m.Groups["member"].Value),
+            "CS0104" when AmbiguousReference().Match(error.Message) is { Success: true } m => PlanAmbiguousReference(token, m.Groups["a"].Value, m.Groups["b"].Value),
             _ => null
         };
     }
+
+    /// <summary>
+    /// CS0104 "'ITenantAppService' is an ambiguous reference between 'MyApp.Tenants.ITenantAppService' and
+    /// 'Volo.Abp.TenantManagement.ITenantAppService'": the solution's own type was meant (the ABP.io one came with a
+    /// using added for the module entities) → global::MyApp.Tenants.ITenantAppService.
+    /// </summary>
+    private static PlannedFix? PlanAmbiguousReference(SyntaxToken token, string a, string b)
+    {
+        static bool IsFramework(string name) => name.StartsWith("Volo.", StringComparison.Ordinal) || name.StartsWith("Microsoft.", StringComparison.Ordinal) ||
+                                                name.StartsWith("System.", StringComparison.Ordinal);
+        var own = (IsFramework(a), IsFramework(b)) switch { (false, true) => a, (true, false) => b, _ => null };
+        if (own is null || token.Parent is not SimpleNameSyntax name || name.Parent is QualifiedNameSyntax { Right: var right } && right == name ||
+            name.Parent is MemberAccessExpressionSyntax { Name: var member } && member == name)
+        {
+            return null;
+        }
+
+        var generic = own.IndexOf('<');
+        var ns = (generic < 0 ? own : own[..generic]);
+        ns = ns[..ns.LastIndexOf('.')];
+        var qualified = ParseTypeName($"global::{ns}.{name.WithoutTrivia()}").WithTriviaFrom(name);
+        return new PlannedFix(name, _ => qualified, "ambiguous reference between the solution's type and an ABP.io type → the solution's type", []);
+    }
+
+    [GeneratedRegex(@"is an ambiguous reference between '(?<a>[^']+)' and '(?<b>[^']+)'")]
+    private static partial Regex AmbiguousReference();
 
     // ---------- members Boilerplate base classes / property injection provided ----------
 
@@ -671,6 +861,17 @@ public sealed partial class BuildFixStep : IMigrationStep
         {
             if (ZeroMappings.MemberRenames.TryGetValue(kind, out var renames) && renames.TryGetValue(member, out var newName))
             {
+                // new { u.EmailAddress } → new { EmailAddress = u.Email }: the anonymous type keeps the property the code reads.
+                if (access.Parent is AnonymousObjectMemberDeclaratorSyntax { NameEquals: null } renamedDeclarator)
+                {
+                    return new PlannedFix(renamedDeclarator, n =>
+                    {
+                        var d = (AnonymousObjectMemberDeclaratorSyntax)n;
+                        var a = (MemberAccessExpressionSyntax)d.Expression;
+                        return SyntaxHelpers.NamedMember(d, member, a.WithName(IdentifierName(newName).WithTriviaFrom(a.Name)));
+                    }, $"{type}.{member} → {newName}", []);
+                }
+
                 return new PlannedFix(name, n => IdentifierName(newName).WithTriviaFrom(n), $"{type}.{member} → {newName}", []);
             }
 
@@ -696,8 +897,8 @@ public sealed partial class BuildFixStep : IMigrationStep
                     {
                         var d = (AnonymousObjectMemberDeclaratorSyntax)n;
                         var a = (MemberAccessExpressionSyntax)d.Expression;
-                        return d.WithNameEquals(NameEquals(member))
-                            .WithExpression(ParseExpression($"{a.Expression.WithoutTrivia()}.GetProperty<{propertyType}>(\"{member}\")"));
+                        return SyntaxHelpers.NamedMember(d, member,
+                            ParseExpression($"{a.Expression.WithoutTrivia()}.GetProperty<{propertyType}>(\"{member}\")"));
                     }, $"{type}.{member} → GetProperty (extra property)", ["Volo.Abp.Data"]);
                 }
 
@@ -761,7 +962,7 @@ public sealed partial class BuildFixStep : IMigrationStep
             return new PlannedFix(declarator, n =>
             {
                 var d = (AnonymousObjectMemberDeclaratorSyntax)n;
-                return d.WithNameEquals(NameEquals("FullName")).WithExpression(ParseExpression(replacement(d.Expression)));
+                return SyntaxHelpers.NamedMember(d, "FullName", ParseExpression(replacement(d.Expression)));
             }, kind, []);
         }
 

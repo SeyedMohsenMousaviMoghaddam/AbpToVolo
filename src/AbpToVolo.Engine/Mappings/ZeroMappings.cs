@@ -1,3 +1,5 @@
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
 using AbpToVolo.Core;
 
 namespace AbpToVolo.Mappings;
@@ -170,6 +172,35 @@ public static class ZeroMappings
         ["TokenAuthController"] = ["Controllers"],
     };
 
+    /// <summary>
+    /// HTTP endpoints (application services, controllers and their interfaces): they are never moved out of the build, even
+    /// when they come from the template or use Module Zero infrastructure — the clients call them. The code that does
+    /// not compile is stubbed member by member instead, so every route of the source stays.
+    /// </summary>
+    public static bool IsEndpointType(BaseTypeDeclarationSyntax type)
+    {
+        var name = type.Identifier.Text;
+        if (type is InterfaceDeclarationSyntax)
+        {
+            return name.EndsWith("AppService", StringComparison.Ordinal) || name.EndsWith("ApplicationService", StringComparison.Ordinal);
+        }
+
+        if (type is not ClassDeclarationSyntax) return false;
+        if (name.EndsWith("AppService", StringComparison.Ordinal) || name.EndsWith("ApplicationService", StringComparison.Ordinal) ||
+            name.EndsWith("Controller", StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        return type.BaseList?.Types.Any(t => t.Type.ToString() is var b &&
+            (b.EndsWith("AppServiceBase", StringComparison.Ordinal) || b.EndsWith("ControllerBase", StringComparison.Ordinal) ||
+             b.Contains("ApplicationService", StringComparison.Ordinal) || b.Contains("AppService<", StringComparison.Ordinal) ||
+             b is "AbpController" or "Controller")) == true;
+    }
+
+    public static bool HasEndpointType(SyntaxNode root) =>
+        root.DescendantNodes().OfType<BaseTypeDeclarationSyntax>().Any(IsEndpointType);
+
     public static bool IsTemplateClass(string name, string? ns)
     {
         if (!TemplateServices.ContainsKey(name)) return false;
@@ -187,8 +218,17 @@ public static class ZeroMappings
             ["IsTwoFactorEnabled"] = "TwoFactorEnabled", ["Password"] = "PasswordHash", ["LockoutEndDateUtc"] = "LockoutEnd",
         },
         [ZeroKind.Role] = new Dictionary<string, string>(StringComparer.Ordinal) { ["DisplayName"] = "Name" },
-        [ZeroKind.Tenant] = new Dictionary<string, string>(StringComparer.Ordinal) { ["TenancyName"] = "Name" },
+        // Tenant: Name stays the display name; TenancyName becomes an entity extension (see MissingBaseProperties).
     };
+
+    /// <summary>Boilerplate base-class members without an ABP.io counterpart: kept as entity extensions (name, type, default).</summary>
+    public static readonly IReadOnlyDictionary<ZeroKind, (string Name, string Type, string? Default)[]> MissingBaseProperties =
+        new Dictionary<ZeroKind, (string, string, string?)[]>
+        {
+            // Boilerplate tenants have TenancyName (identifier) and Name (display name): ABP.io has only Name. The display name
+            // stays Name (the code reading tenant.Name keeps its meaning), TenancyName is kept as an extension.
+            [ZeroKind.Tenant] = [("TenancyName", "string", null), ("IsActive", "bool", "true")],
+        };
 
     /// <summary>Base class of each entity kind, for the inherited constants (ZeroConstants table).</summary>
     public static string? ConstantsBase(ZeroKind kind) => kind switch

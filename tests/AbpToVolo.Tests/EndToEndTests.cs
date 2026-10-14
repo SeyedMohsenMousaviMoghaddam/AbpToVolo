@@ -253,6 +253,26 @@ public sealed class EndToEndTests : IDisposable
         Assert.True(File.Exists(Path.Combine(_output, "keep.txt")));
     }
 
+    [Fact]
+    public void Endpoints_stay_in_the_build_and_keep_the_boilerplate_api()
+    {
+        Run(renameLayers: true);
+
+        // Template endpoints (users, token auth) are not moved to the legacy folder: their routes must stay.
+        Assert.True(File.Exists(Path.Combine(_output, "src/Acme.PhoneBook.Application/Users/UserAppService.cs")));
+        Assert.True(File.Exists(Path.Combine(_output, "src/Acme.PhoneBook.HttpApi/Controllers/TokenAuthController.cs")));
+
+        var api = Read($"src/Acme.PhoneBook.HttpApi/{CompatShimStep.ShimFolder}/BoilerplateApi.cs");
+        Assert.Contains("class BoilerplateConventionalRouteBuilder : ConventionalRouteBuilder", api);
+        Assert.Contains("$\"api/services/{rootPath}/{BoilerplateApi.ServiceName(type)}/{ActionName(action, type)}\"", api);
+        Assert.Contains("? \"GetAll\"", api); // CRUD GetListAsync keeps the Boilerplate route
+        Assert.Contains("class BoilerplateResultWrapFilter : IAsyncAlwaysRunResultFilter", api);
+        Assert.Contains("global::Acme.PhoneBook.BoilerplateApi.ConfigureServices(context.Services);", Read("src/Acme.PhoneBook.HttpApi/PhoneBookHttpApiModule.cs"));
+        var models = Read($"src/Acme.PhoneBook.Domain.Shared/{CompatShimStep.ShimFolder}/BoilerplateApiModels.cs");
+        Assert.Contains("public class AjaxResponse : AjaxResponse<object>", models);
+        Assert.Contains("[JsonPropertyName(\"__abp\")]", models);
+    }
+
     public void Dispose()
     {
         if (Directory.Exists(_output)) Directory.Delete(_output, recursive: true);

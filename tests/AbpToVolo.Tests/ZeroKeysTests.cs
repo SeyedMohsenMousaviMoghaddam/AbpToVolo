@@ -222,4 +222,32 @@ public sealed class ZeroKeysTests : RewriterTestBase
         Assert.Contains(conversions, c => c.Column == "TenantId");
         Assert.DoesNotContain(conversions, c => c.Column == "OwnerUserId"); // the application's own reference keeps long
     }
+
+    [Fact]
+    public void Tenants_keep_their_source_id_display_name_and_tenancy_name()
+    {
+        var sql = ZeroDatabase.DataMigrationSql(new Dictionary<string, string>(),
+            [(Mappings.ZeroKind.Tenant, "TenancyName"), (Mappings.ZeroKind.Tenant, "IsActive")], legacyIds: true);
+
+        // The old int id → LegacyId; Name = the Boilerplate display name; TenancyName and IsActive → extension columns.
+        Assert.Contains("ConcurrencyStamp, [TenancyName], [IsActive], [LegacyId])", sql);
+        Assert.Contains("SELECT m.NewId, n.Name, UPPER(n.Name), 0,", sql);
+        Assert.Contains(", t.[TenancyName], t.[IsActive], t.Id", sql);
+        Assert.Contains("LEFT(COALESCE(NULLIF(LTRIM(RTRIM(t.Name)), N''), t.TenancyName), 64)", sql);
+        Assert.Contains("ALTER SEQUENCE dbo.AbpTenantLegacyIds RESTART WITH", sql);
+
+        // Without --id-type source no LegacyId column.
+        Assert.DoesNotContain("[LegacyId]", ZeroDatabase.DataMigrationSql(new Dictionary<string, string>(), [], legacyIds: false));
+    }
+
+    [Fact]
+    public void Renamed_members_keep_their_name_in_anonymous_types()
+    {
+        var declarator = (Microsoft.CodeAnalysis.CSharp.Syntax.AnonymousObjectMemberDeclaratorSyntax)
+            ((Microsoft.CodeAnalysis.CSharp.Syntax.AnonymousObjectCreationExpressionSyntax)SyntaxFactory.ParseExpression("new\n{\n    x.Id,\n    x.Name\n}")).Initializers[0];
+
+        var named = CodeMigration.SyntaxHelpers.NamedMember(declarator, "Id", SyntaxFactory.ParseExpression("EF.Property<int>(x, \"LegacyId\")"));
+
+        Assert.Equal("    Id = EF.Property<int>(x, \"LegacyId\")", named.ToFullString()); // the line break belongs to "{"
+    }
 }

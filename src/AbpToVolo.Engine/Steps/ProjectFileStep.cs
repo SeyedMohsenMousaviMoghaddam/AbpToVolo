@@ -97,7 +97,7 @@ public sealed class ProjectFileStep : IMigrationStep
 
         var existing = root.Descendants("PackageReference")
             .Select(r => r.Attribute("Include")?.Value)
-            .Where(v => v is not null)
+            .OfType<string>()
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
         // Packages/frameworks the code needs (Boilerplate packages used to bring them transitively).

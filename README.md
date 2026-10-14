@@ -33,9 +33,10 @@ The Windows app sets the source and destination folders, the ABP version, target
 | `--no-compiler-fixes` | Do not build the output and fix compiler errors |
 | `--stub-unresolved` | Members that still do not compile keep their converted body under `#if ABPTOVOLO_ORIGINAL` and throw `NotImplementedException`, so the whole solution compiles (each one is listed in the report) |
 | `--id-type source\|guid` | Key type of the application's references to users/roles (`UserId`, `RoleId`…): `source` (default) keeps the source type (long/int), linked to the ABP.io entities through `LegacyId`; `guid` converts them to Guid. ABP.io module fields (`TenantId`, `CreatorId`…) are Guid in both |
+| `--api-style boilerplate\|abp` | `boilerplate` (default): the converted host keeps the HTTP API of the source — `/api/services/app/{Service}/{Action}` routes and the `AjaxResponse` envelope — so the existing front end works unchanged; `abp`: ABP.io conventions (`/api/app/{service}`, results not wrapped) |
 | `--connection-string <cs>` | `ConnectionStrings:Default` of the converted host and DbMigrator (or `ABPTOVOLO_CONNECTION_STRING`; never saved with the settings) |
 | `--migrate-database` | Run the converted DbMigrator after the conversion (**changes that database — use a copy**) |
-| `--verify-host` | Start the converted host, check that Swagger answers (`/swagger/v1/swagger.json`, `/swagger/index.html`), stop it; the result is in the report |
+| `--verify-host` | Start the converted host, check that Swagger answers (`/swagger/v1/swagger.json`, `/swagger/index.html`), compare its endpoints with the source's, stop it; the result is in the report |
 | `--build`, `--force`, `--verbose` | Final build with the errors in the report, replace a non-empty output, full log |
 
 Output: the converted solution, `ABP-MIGRATION-REPORT.md` (checklist of the manual work, with lines), `abp-migration-report.json` and `abp-migration.log` (full log of every step).
@@ -130,6 +131,19 @@ ABP.io's Identity and TenantManagement modules use Guid keys. The module fields 
 | Link to `IdentityUser`/`IdentityRole` | `LegacyId` extension property/column (old id; new rows numbered by a sequence), `HasPrincipalKey("LegacyId")` for every navigation with a long/int key | the Guid key |
 | Current user | `CurrentUser.GetLegacyId()` / `GetRequiredLegacyId()` (claim `legacy_user_id`) | `CurrentUser.Id` |
 | Find a user by the old id | `ILegacyIdLookup.FindUserAsync(long)`, `user.GetLegacyId()` | — |
+| Tenant ids in the application's code and API | int, as in the source: `Tenant.LegacyId` (old id; new tenants numbered by a sequence). `tenant.Id` used as an int becomes `EF.Property<int>(t, "LegacyId")` in EF Core queries and `tenant.GetLegacyId()` elsewhere; `repository.DeleteAsync(intId)` becomes a `LegacyId` predicate; the `Abp.TenantId` header/cookie of Boilerplate clients selects the tenant with that `LegacyId` | Guid |
+
+Tenants: Boilerplate has `TenancyName` (identifier) and `Name` (display name), ABP.io only `Name`. `Name` keeps the display name (at most 64 characters, made unique with the tenancy name if needed), and `TenancyName` and `IsActive` are kept as tenant extensions on the same data, so `tenant.Name` and `tenant.TenancyName` keep their meaning in the code.
+
+Entity extensions (`GetProperty`, `GetLegacyId()`) read inside EF Core queries cannot be translated to SQL: once the solution compiles, they are rewritten to `EF.Property<T>(x, "Name")`, using the semantic model of the converted projects with their real references.
+
+### HTTP API (`--api-style`)
+
+Every endpoint of the source stays, at the same path and HTTP verb, so the front end keeps working:
+
+- Application services and controllers are never moved to the legacy folder, even the template ones (`UserAppService`, `TenantAppService`, `SessionAppService`, `TokenAuthController`…). What does not compile is stubbed member by member (a constructor parameter or field that does not resolve is removed, an unknown type in a signature becomes `object`, a method body throws `NotImplementedException`), so the route exists and the report lists what to finish.
+- `boilerplate` (default) generates `BoilerplateApi` in the HttpApi project: an `IConventionalRouteBuilder` replacement for the `/api/services/app/{Service}/{Action}` routes (same verb rules: `Get…` → GET, `Update…` → PUT, `Delete…` → DELETE, otherwise POST), and a result filter that returns results, errors (`RemoteServiceErrorResponse`) and 401/403 answers as `{ result, targetUrl, success, error, unAuthorizedRequest, __abp }`. `[DontWrapResult]`/`[WrapResult]` keep working (compatibility types in Domain.Shared). The ABP.io module endpoints (`/api/abp/…`, `/api/identity/…`, `/connect/token`) are unchanged.
+- `--verify-host` compares the endpoints of the source (Boilerplate conventions) with the converted `swagger.json` and lists the missing ones and the changed verbs ("Endpoints of the source" in the report).
 
 ### SQL views
 
