@@ -27,18 +27,26 @@ public sealed partial class BuildFixStep
         "GetAsync", "FindAsync", "DeleteAsync", "Get", "Find", "Delete", "FirstOrDefaultAsync", "SingleAsync", "SingleOrDefaultAsync", "FirstAsync"
     };
 
-    /// <summary>Tenant ids (int in the source) → LegacyId, for the type errors the compiler reports.</summary>
+    /// <summary>
+    /// Fixes of the errors the compiler reports that need the real types: source ids ↔ ABP.io ids (--id-type source),
+    /// former navigations of Zero entities (User.People) and Module Zero columns ABP.io entities lack (UserToken.ExpireDate).
+    /// </summary>
     private int ApplySemanticFixes(MigrationContext context, List<BuildDiagnostic> errors, Dictionary<string, int> totals)
     {
-        if (context.Options.IdType != IdTypeMode.Source || !context.UsesIdentityModules) return 0;
+        if (!context.UsesIdentityModules) return 0;
+        var legacyIds = context.Options.IdType == IdTypeMode.Source;
         var applied = 0;
-        foreach (var group in errors.Where(e => TypeMismatchCodes.Contains(e.Code)).GroupBy(e => e.Project, StringComparer.OrdinalIgnoreCase))
+        var relevant = errors.Where(e => legacyIds && TypeMismatchCodes.Contains(e.Code) ||
+                                         e.Code == "CS1061" && MissingMember().Match(e.Message) is { Success: true } m &&
+                                         IsZeroMember(context, m.Groups["type"].Value, m.Groups["member"].Value));
+        foreach (var group in relevant.GroupBy(e => e.Project, StringComparer.OrdinalIgnoreCase))
         {
             if (context.Projects.FirstOrDefault(p => string.Equals(p.Name, group.Key, StringComparison.OrdinalIgnoreCase)) is not { } project) continue;
             if (SemanticProject.Load(project.CsprojPath) is not { } semantic) continue;
             if (semantic.Compilation.GetTypeByMetadataName(TenantType) is null) continue;
 
             var edits = new Dictionary<SyntaxTree, Dictionary<SyntaxNode, SyntaxNode>>();
+            var declarations = new Dictionary<BlockSyntax, List<string>>();
             foreach (var error in group)
             {
                 if (!semantic.Trees.TryGetValue(error.File, out var tree)) continue;
@@ -47,26 +55,129 @@ public sealed partial class BuildFixStep
                 var position = text.Lines[error.Line - 1].Start + Math.Max(0, error.Column - 1);
                 var model = semantic.Compilation.GetSemanticModel(tree);
                 var node = tree.GetRoot().FindToken(position).Parent;
-                var expression = node?.AncestorsAndSelf().OfType<ExpressionSyntax>().TakeWhile(e => e.SpanStart == position).LastOrDefault();
+                if (node is null) continue;
+
+                if (error.Code == "CS1061")
+                {
+                    var member = MissingMember().Match(error.Message);
+                    PlanZeroMember(context, semantic, model, node, member.Groups["type"].Value, member.Groups["member"].Value, edits, declarations);
+                    continue;
+                }
+
+                var expression = node.AncestorsAndSelf().OfType<ExpressionSyntax>().TakeWhile(e => e.SpanStart == position).LastOrDefault();
                 if (expression is null) continue;
 
+                var before = edits.Values.Sum(e => e.Count);
                 PlanTenantIdFixes(semantic, model, expression, edits);
+                if (edits.Values.Sum(e => e.Count) == before) PlanTenantIdConversion(semantic, model, node, expression, error, edits);
             }
 
-            applied += WriteEdits(context, edits, totals, "Tenant.Id → LegacyId (the application keeps the int tenant ids of the source)");
+            applied += WriteEdits(context, edits, totals, "source ids ↔ ABP.io ids, Zero navigations and columns (semantic fixes)", declarations);
         }
 
         return applied;
     }
 
+    private static bool IsZeroMember(MigrationContext context, string type, string member)
+    {
+        var simple = type.Split('.').Last();
+        return context.ZeroNavigations.TryGetValue(simple, out var navigations) && navigations.ContainsKey(member) ||
+               Mappings.ZeroMappings.MissingEntityColumns.TryGetValue(simple, out var columns) && columns.Any(c => c.Name == member);
+    }
+
+    /// <summary>
+    /// A member the ABP.io entity does not have:
+    ///   - former navigation (user.People): in an EF Core query a subquery on the foreign key
+    ///     (__peopleQuery.FirstOrDefault(p => p.Id == EF.Property&lt;int?&gt;(user, "PeopleId"))), elsewhere the repository
+    ///     (await repository.FindAsync(user's PeopleId)); in Include(...) the include is removed;
+    ///   - Module Zero column kept as an EF shadow property (token.ExpireDate): EF.Property in queries, EntityShadowProperties
+    ///     Get / Set elsewhere.
+    /// </summary>
+    private static void PlanZeroMember(MigrationContext context, SemanticProject semantic, SemanticModel model, SyntaxNode node, string type, string member,
+        Dictionary<SyntaxTree, Dictionary<SyntaxNode, SyntaxNode>> edits, Dictionary<BlockSyntax, List<string>> declarations)
+    {
+        if (node.AncestorsAndSelf().OfType<MemberAccessExpressionSyntax>().FirstOrDefault(a => a.Name.Identifier.Text == member) is not { } access) return;
+        var receiver = access.Expression.WithoutTrivia();
+        var inQuery = InExpressionTree(model, access);
+        var simple = type.Split('.').Last();
+
+        // Module Zero column kept as a shadow property
+        if (Mappings.ZeroMappings.MissingEntityColumns.TryGetValue(simple, out var columns) && columns.FirstOrDefault(c => c.Name == member) is { Name: not null } column)
+        {
+            if (FindType(semantic.Compilation, "EntityShadowProperties") is not { } store) return;
+            var storeName = "global::" + store.ToDisplayString();
+            if (access.Parent is AssignmentExpressionSyntax { RawKind: (int)SyntaxKind.SimpleAssignmentExpression, Parent: ExpressionStatementSyntax statement } assignment &&
+                assignment.Left == access)
+            {
+                Add(edits, statement, ParseStatement($"{storeName}.Set({receiver}, \"{member}\", {assignment.Right.WithoutTrivia()});").WithTriviaFrom(statement));
+            }
+            else if (!IsAssignmentTarget(access))
+            {
+                Add(edits, access, (inQuery
+                    ? ParseExpression($"EF.Property<{column.Type}>({receiver}, \"{member}\")")
+                    : ParseExpression($"{storeName}.Get<{column.Type}>({receiver}, \"{member}\")")).WithTriviaFrom(access));
+            }
+
+            return;
+        }
+
+        if (!context.ZeroNavigations.TryGetValue(simple, out var navigations) || !navigations.TryGetValue(member, out var navigation)) return;
+        if (IsAssignmentTarget(access)) return;
+
+        // .Include(u => u.People): the navigation does not exist any more → the include goes.
+        if (access.Ancestors().OfType<InvocationExpressionSyntax>().FirstOrDefault(i => i.Expression is MemberAccessExpressionSyntax { Name.Identifier.Text: "Include" or "ThenInclude" } &&
+                i.ArgumentList.Arguments.Any(a => a.Span.Contains(access.Span))) is { Expression: MemberAccessExpressionSyntax include } includeCall)
+        {
+            Add(edits, includeCall, include.Expression.WithTriviaFrom(includeCall));
+            return;
+        }
+
+        if (semantic.Compilation.GetTypeByMetadataName(navigation.TargetType) is not { } target) return;
+        var key = Members(target).OfType<IPropertySymbol>().FirstOrDefault(p => p.Name == "Id")?.Type.ToDisplayString();
+        var method = access.Ancestors().FirstOrDefault(a => a is BaseMethodDeclarationSyntax or LocalFunctionStatementSyntax or AccessorDeclarationSyntax);
+        var body = method switch { BaseMethodDeclarationSyntax m => m.Body, LocalFunctionStatementSyntax f => f.Body, AccessorDeclarationSyntax a => a.Body, _ => null };
+        if (key is null || body is null || model.LookupSymbols(access.SpanStart, name: "LazyServiceProvider").IsEmpty) return;
+
+        var isAsync = method switch { BaseMethodDeclarationSyntax m => m.Modifiers.Any(SyntaxKind.AsyncKeyword), LocalFunctionStatementSyntax f => f.Modifiers.Any(SyntaxKind.AsyncKeyword), _ => false };
+        var repository = $"LazyServiceProvider.LazyGetRequiredService<global::Volo.Abp.Domain.Repositories.IRepository<global::{navigation.TargetType}, {key}>>()";
+        string Await(string task) => isAsync ? $"await {task}" : $"global::Volo.Abp.Threading.AsyncHelper.RunSync(() => {task})";
+
+        if (inQuery)
+        {
+            // A subquery on the foreign key (EF Core translates it, also .Member and == null after it).
+            var variable = $"__{char.ToLowerInvariant(target.Name[0])}{target.Name[1..]}Query";
+            if (!declarations.TryGetValue(body, out var list)) declarations[body] = list = [];
+            if (!list.Any(d => d.Contains($" {variable} =", StringComparison.Ordinal))) list.Add($"var {variable} = {Await($"{repository}.GetQueryableAsync()")};");
+            Add(edits, access, ParseExpression(
+                    $"{variable}.FirstOrDefault(__x => ({navigation.ForeignKeyType.TrimEnd('?')}?)__x.Id == EF.Property<{navigation.ForeignKeyType}>({receiver}, \"{navigation.ForeignKey}\"))")
+                .WithTriviaFrom(access));
+            return;
+        }
+
+        // In memory: load the target by its key.
+        var foreignKey = $"global::Volo.Abp.Data.HasExtraPropertiesExtensions.GetProperty<{navigation.ForeignKeyType}>({Parenthesize(receiver)}, \"{navigation.ForeignKey}\")";
+        var load = navigation.ForeignKeyType.EndsWith('?')
+            ? $"({foreignKey} is {{ }} __{navigation.ForeignKey}{access.SpanStart} ? {Await($"{repository}.FindAsync(__{navigation.ForeignKey}{access.SpanStart})")} : null)"
+            : $"({Await($"{repository}.FindAsync({foreignKey})")})";
+        Add(edits, access, ParseExpression(load).WithTriviaFrom(access));
+    }
+
+    private static IEnumerable<ISymbol> Members(INamedTypeSymbol type)
+    {
+        for (var t = type; t is not null; t = t.BaseType)
+        {
+            foreach (var m in t.GetMembers()) yield return m;
+        }
+    }
+
     private static void PlanTenantIdFixes(SemanticProject semantic, SemanticModel model, ExpressionSyntax expression, Dictionary<SyntaxTree, Dictionary<SyntaxNode, SyntaxNode>> edits)
     {
-        // repository.DeleteAsync(input.Id) on a Tenant repository → DeleteAsync(t => EF.Property<int>(t, "LegacyId") == input.Id)
+        // repository.DeleteAsync(input.Id) on a Tenant/IdentityUser/IdentityRole repository → DeleteAsync(t => EF.Property<int>(t, "LegacyId") == input.Id)
         if (expression.Parent is ArgumentSyntax { Parent: ArgumentListSyntax { Arguments.Count: 1, Parent: InvocationExpressionSyntax { Expression: MemberAccessExpressionSyntax call } } } &&
-            RepositoryIdMethods.Contains(call.Name.Identifier.Text) && IsTenantRepository(model.GetTypeInfo(call.Expression).Type) &&
+            RepositoryIdMethods.Contains(call.Name.Identifier.Text) && LegacyRepositoryKey(model.GetTypeInfo(call.Expression).Type) is { } repositoryKey &&
             model.GetTypeInfo(expression).Type?.SpecialType is SpecialType.System_Int32 or SpecialType.System_Int64)
         {
-            var predicate = ParseExpression($"__t => EF.Property<int>(__t, \"{LegacyIdProperty}\") == {expression.WithoutTrivia()}");
+            var predicate = ParseExpression($"__t => EF.Property<{repositoryKey}>(__t, \"{LegacyIdProperty}\") == {expression.WithoutTrivia()}");
             Add(edits, expression, predicate.WithTriviaFrom(expression));
             return;
         }
@@ -74,9 +185,9 @@ public sealed partial class BuildFixStep
         foreach (var access in expression.DescendantNodesAndSelf().OfType<MemberAccessExpressionSyntax>().Where(m => m.Name.Identifier.Text == "Id"))
         {
             if (IsAssignmentTarget(access)) continue;
-            if (IsTenant(model.GetTypeInfo(access.Expression).Type))
+            if (LegacyKey(model.GetTypeInfo(access.Expression).Type) is { } key)
             {
-                Add(edits, access, LegacyAccess(model, access, access.Expression));
+                Add(edits, access, LegacyAccess(model, access, access.Expression, key));
                 continue;
             }
 
@@ -88,6 +199,75 @@ public sealed partial class BuildFixStep
         }
     }
 
+    /// <summary>
+    /// A source id (DTOs/models: tenant int, user long) meets an ABP.io id (Guid: entities, CurrentTenant.Id, CurrentUser.Id):
+    ///   tenant: int → Guid LegacyTenantIds.ToTenantGuid, Guid → int ToLegacyTenantId (only where the code mentions "tenant");
+    ///   user:   long → Guid LegacyUserIds.ToUserGuid, Guid → long ToLegacyUserId (user ids are the only long ids).
+    /// </summary>
+    private static void PlanTenantIdConversion(SemanticProject semantic, SemanticModel model, SyntaxNode node, ExpressionSyntax expression, BuildDiagnostic error,
+        Dictionary<SyntaxTree, Dictionary<SyntaxNode, SyntaxNode>> edits)
+    {
+        static bool IsGuid(string type) => type.TrimEnd('?') is "System.Guid" or "Guid";
+        static string? Legacy(string type) => type.TrimEnd('?') switch { "int" or "System.Int32" => "tenant", "long" or "System.Int64" => "user", _ => null };
+
+        ExpressionSyntax? target = null;
+        string? kind = null;
+        var toGuid = false;
+        if (ConversionMessage().Match(error.Message) is { Success: true } conversion)
+        {
+            var (from, to) = (conversion.Groups["from"].Value, conversion.Groups["to"].Value);
+            target = error.Code == "CS1503" ? expression.AncestorsAndSelf().OfType<ArgumentSyntax>().FirstOrDefault()?.Expression ?? expression : expression;
+            if (IsGuid(from) && Legacy(to) is { } toKind) kind = toKind;
+            else if (Legacy(from) is { } fromKind && IsGuid(to)) (kind, toGuid) = (fromKind, true);
+        }
+        else if (error.Code == "CS0019" && OperatorMessage().Match(error.Message) is { Success: true } op &&
+                 node.AncestorsAndSelf().OfType<BinaryExpressionSyntax>().FirstOrDefault(b => b.OperatorToken.Text == op.Groups["op"].Value) is { } binary)
+        {
+            // Compare as Guid: the source-typed side (a DTO / parameter value) is converted.
+            var (a, b) = (op.Groups["a"].Value, op.Groups["b"].Value);
+            if (IsGuid(a) && Legacy(b) is { } right) (target, kind, toGuid) = (binary.Right, right, true);
+            else if (Legacy(a) is { } left && IsGuid(b)) (target, kind, toGuid) = (binary.Left, left, true);
+        }
+
+        if (target is null || kind is null) return;
+        if (kind == "tenant")
+        {
+            var context = (SyntaxNode?)target.AncestorsAndSelf().FirstOrDefault(n => n is StatementSyntax or AnonymousObjectMemberDeclaratorSyntax or
+                AssignmentExpressionSyntax or ArgumentSyntax or BinaryExpressionSyntax) ?? target;
+            // An argument: the method it is passed to tells (CurrentTenant.Change(1), SetTenantId(id)…).
+            var about = context is ArgumentSyntax { Parent.Parent: InvocationExpressionSyntax invocation } ? invocation.Expression + context.ToString() : context.ToString();
+            if (!about.Contains("tenant", StringComparison.OrdinalIgnoreCase)) return;
+        }
+
+        // Generated in Domain.Shared (a referenced project) by LegacyIdStep.
+        var (helperType, method) = kind == "tenant"
+            ? ("LegacyTenantIds", toGuid ? "ToTenantGuid" : "ToLegacyTenantId")
+            : ("LegacyUserIds", toGuid ? "ToUserGuid" : "ToLegacyUserId");
+        if (FindType(semantic.Compilation, helperType) is not { } helper) return;
+        Add(edits, target, ParseExpression($"global::{helper.ToDisplayString()}.{method}({target.WithoutTrivia()})").WithTriviaFrom(target));
+    }
+
+    /// <summary>A type of the compilation (its own sources or a referenced project) by its simple name.</summary>
+    private static INamedTypeSymbol? FindType(Compilation compilation, string name)
+    {
+        static IEnumerable<INamedTypeSymbol> Types(INamespaceSymbol ns) =>
+            ns.GetTypeMembers().Concat(ns.GetNamespaceMembers().SelectMany(Types));
+
+        return compilation.SourceModule.ReferencedAssemblySymbols
+            .Where(a => !a.Name.StartsWith("Volo.", StringComparison.Ordinal) && !a.Name.StartsWith("Microsoft.", StringComparison.Ordinal) &&
+                        !a.Name.StartsWith("System", StringComparison.Ordinal))
+            .Select(a => a.GlobalNamespace)
+            .Prepend(compilation.Assembly.GlobalNamespace)
+            .SelectMany(Types)
+            .FirstOrDefault(t => t.Name == name);
+    }
+
+    [System.Text.RegularExpressions.GeneratedRegex(@"(?:Cannot implicitly convert type|cannot convert from) '(?<from>[^']+)' to '(?<to>[^']+)'")]
+    private static partial System.Text.RegularExpressions.Regex ConversionMessage();
+
+    [System.Text.RegularExpressions.GeneratedRegex(@"Operator '(?<op>[^']+)' cannot be applied to operands of type '(?<a>[^']+)' and '(?<b>[^']+)'")]
+    private static partial System.Text.RegularExpressions.Regex OperatorMessage();
+
     private static void PlanAnonymousTenantId(SemanticProject semantic, IPropertySymbol property, Dictionary<SyntaxTree, Dictionary<SyntaxNode, SyntaxNode>> edits, int depth)
     {
         if (depth > 3) return;
@@ -98,10 +278,10 @@ public sealed partial class BuildFixStep
             var value = declarator.Expression;
             if (value is MemberAccessExpressionSyntax { Name.Identifier.Text: "Id" } source)
             {
-                if (IsTenant(model.GetTypeInfo(source.Expression).Type))
+                if (LegacyKey(model.GetTypeInfo(source.Expression).Type) is { } key)
                 {
                     var name = declarator.NameEquals?.Name.Identifier.Text ?? "Id";
-                    Add(edits, declarator, SyntaxHelpers.NamedMember(declarator, name, LegacyAccess(model, source, source.Expression)));
+                    Add(edits, declarator, SyntaxHelpers.NamedMember(declarator, name, LegacyAccess(model, source, source.Expression, key)));
                 }
                 else if (model.GetSymbolInfo(source).Symbol is IPropertySymbol { ContainingType.IsAnonymousType: true } inner)
                 {
@@ -112,9 +292,9 @@ public sealed partial class BuildFixStep
     }
 
     /// <summary>The tenant's legacy id: EF.Property inside an EF Core query (expression tree), GetLegacyId() elsewhere.</summary>
-    private static ExpressionSyntax LegacyAccess(SemanticModel model, SyntaxNode at, ExpressionSyntax receiver) =>
+    private static ExpressionSyntax LegacyAccess(SemanticModel model, SyntaxNode at, ExpressionSyntax receiver, string key) =>
         (InExpressionTree(model, at)
-            ? ParseExpression($"EF.Property<int>({receiver.WithoutTrivia()}, \"{LegacyIdProperty}\")")
+            ? ParseExpression($"EF.Property<{key}>({receiver.WithoutTrivia()}, \"{LegacyIdProperty}\")")
             : ParseExpression($"{Parenthesize(receiver.WithoutTrivia())}.GetLegacyId()"))
         .WithTriviaFrom(at);
 
@@ -122,16 +302,33 @@ public sealed partial class BuildFixStep
 
     private static bool IsAssignmentTarget(ExpressionSyntax e) => e.Parent is AssignmentExpressionSyntax assignment && assignment.Left == e;
 
-    private static bool IsTenant(ITypeSymbol? type) => type?.OriginalDefinition.ToDisplayString() == TenantType;
+    /// <summary>The source key type kept as LegacyId by the ABP.io entity (--id-type source), or null.</summary>
+    private static string? LegacyKey(ITypeSymbol? type) => type?.OriginalDefinition.ToDisplayString() switch
+    {
+        TenantType => "int",
+        "Volo.Abp.Identity.IdentityRole" => "int",
+        "Volo.Abp.Identity.IdentityUser" => "long",
+        _ => null
+    };
 
-    private static bool IsTenantRepository(ITypeSymbol? type) =>
-        type is INamedTypeSymbol named && named.AllInterfaces.Append(named).Any(i => i.TypeArguments.Any(IsTenant));
+    private static string? LegacyRepositoryKey(ITypeSymbol? type) =>
+        type is INamedTypeSymbol named
+            ? named.AllInterfaces.Append(named).SelectMany(i => i.TypeArguments).Select(LegacyKey).FirstOrDefault(k => k is not null)
+            : null;
 
     /// <summary>Inside a lambda that is converted to an expression tree (an IQueryable operator: translated to SQL).</summary>
     private static bool InExpressionTree(SemanticModel model, SyntaxNode node) =>
         node.Ancestors().OfType<LambdaExpressionSyntax>().Any(lambda =>
             model.GetTypeInfo(lambda).ConvertedType is INamedTypeSymbol { Name: "Expression" } converted &&
-            converted.ContainingNamespace.ToDisplayString() == "System.Linq.Expressions");
+            converted.ContainingNamespace.ToDisplayString() == "System.Linq.Expressions" ||
+            // The lambda does not bind (it contains the error being fixed): an argument of a LINQ operator on an IQueryable.
+            lambda.Parent is ArgumentSyntax { Parent: ArgumentListSyntax { Parent: InvocationExpressionSyntax { Expression: MemberAccessExpressionSyntax call } } } &&
+            IsQueryable(model.GetTypeInfo(call.Expression).Type)) ||
+        // Query syntax (from x in query ... select ...) over an IQueryable.
+        node.Ancestors().OfType<QueryExpressionSyntax>().Any(query => IsQueryable(model.GetTypeInfo(query.FromClause.Expression).Type));
+
+    private static bool IsQueryable(ITypeSymbol? type) =>
+        type is not null && (type.Name == "IQueryable" || type.AllInterfaces.Any(i => i.Name == "IQueryable" && i.ContainingNamespace.ToDisplayString() == "System.Linq"));
 
     private static void Add(Dictionary<SyntaxTree, Dictionary<SyntaxNode, SyntaxNode>> edits, SyntaxNode node, SyntaxNode replacement)
     {
@@ -140,16 +337,33 @@ public sealed partial class BuildFixStep
         file[node] = replacement;
     }
 
-    private int WriteEdits(MigrationContext context, Dictionary<SyntaxTree, Dictionary<SyntaxNode, SyntaxNode>> edits, Dictionary<string, int> totals, string kind)
+    private int WriteEdits(MigrationContext context, Dictionary<SyntaxTree, Dictionary<SyntaxNode, SyntaxNode>> edits, Dictionary<string, int> totals, string kind,
+        Dictionary<BlockSyntax, List<string>>? declarations = null)
     {
         var applied = 0;
         foreach (var (tree, replacements) in edits)
         {
             if (replacements.Count == 0 || !File.Exists(tree.FilePath) || context.IsExcluded(tree.FilePath)) continue;
             var (_, encoding) = FileSystem.ReadText(tree.FilePath);
-            var updated = tree.GetRoot().ReplaceNodes(replacements.Keys, (original, _) => replacements[original]).ToFullString();
+
+            // Local declarations the replacements use (e.g. "var __peopleQuery = ...") go at the start of their method body.
+            var blocks = declarations?.Where(d => d.Key.SyntaxTree == tree && d.Value.Count > 0).ToDictionary(d => d.Key, d => d.Value) ?? [];
+            var updated = tree.GetRoot().ReplaceNodes(replacements.Keys.Concat(blocks.Keys), (original, rewritten) =>
+            {
+                if (original is BlockSyntax block && blocks.TryGetValue(block, out var statements))
+                {
+                    var current = replacements.TryGetValue(original, out var replaced) ? (BlockSyntax)replaced : (BlockSyntax)rewritten;
+                    var indent = current.Statements.Count > 0 ? SyntaxHelpers.Indentation(current.Statements[0]) : SyntaxHelpers.Indentation(current) + "    ";
+                    var nl = tree.GetText().ToString().Contains("\r\n", StringComparison.Ordinal) ? "\r\n" : "\n";
+                    var added = statements.Select(s => ParseStatement(s).WithLeadingTrivia(Whitespace(indent)).WithTrailingTrivia(EndOfLine(nl)));
+                    return current.WithStatements(current.Statements.InsertRange(0, added));
+                }
+
+                return replacements[original];
+            }).ToFullString();
             var usings = new List<string>();
             if (replacements.Values.Any(r => r.ToString().Contains("EF.Property<", StringComparison.Ordinal))) usings.Add("Microsoft.EntityFrameworkCore");
+            if (blocks.Count > 0) usings.Add("System.Linq");
             FileSystem.WriteText(tree.FilePath, ModuleMethodEditor.AddUsings(updated, usings), encoding);
             totals[kind] = totals.GetValueOrDefault(kind) + replacements.Count;
             context.Report.Change(Name, $"{replacements.Count} × {kind}", context.Relative(tree.FilePath));

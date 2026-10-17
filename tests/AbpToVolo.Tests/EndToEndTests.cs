@@ -271,6 +271,25 @@ public sealed class EndToEndTests : IDisposable
         var models = Read($"src/Acme.PhoneBook.Domain.Shared/{CompatShimStep.ShimFolder}/BoilerplateApiModels.cs");
         Assert.Contains("public class AjaxResponse : AjaxResponse<object>", models);
         Assert.Contains("[JsonPropertyName(\"__abp\")]", models);
+
+        // The TokenAuth login keeps working: LogInManager → generated compatibility class, JWT accepted next to OpenIddict.
+        var controller = Read("src/Acme.PhoneBook.HttpApi/Controllers/TokenAuthController.cs");
+        Assert.Contains("LogInManager", controller);
+        Assert.DoesNotContain("AbpSignInManager", controller);
+        var login = Read($"src/Acme.PhoneBook.Domain/{CompatShimStep.ShimFolder}/LogInManagerCompat.cs");
+        Assert.Contains("public virtual async Task<AbpLoginResult<Tenant, IdentityUser>> LoginAsync(", login);
+        Assert.Contains("public class AbpLoginResultTypeHelper", login);
+
+        // --id-type source: source ids ↔ ABP.io ids where DTOs and entities meet.
+        var maps = Read($"src/Acme.PhoneBook.Domain.Shared/{CompatShimStep.ShimFolder}/LegacyIdMaps.cs");
+        Assert.Contains("public static Guid ToTenantGuid(int legacyId)", maps);
+        Assert.Contains("public static long ToLegacyUserId(Guid id)", maps);
+
+        // Module Zero columns ABP.io entities lack (UserToken.ExpireDate) stay as shadow properties.
+        Assert.Contains("builder.Entity<IdentityUserToken>().Property<DateTime?>(\"ExpireDate\");",
+            Read("src/Acme.PhoneBook.EntityFrameworkCore/EntityFrameworkCore/ModuleZeroColumns.cs"));
+        Assert.Contains(".ConfigureModuleZeroColumns();", Read("src/Acme.PhoneBook.EntityFrameworkCore/EntityFrameworkCore/PhoneBookDbContext.cs"));
+        Assert.Contains("public static class EntityShadowProperties", Read($"src/Acme.PhoneBook.Domain.Shared/{CompatShimStep.ShimFolder}/EntityShadowProperties.cs"));
     }
 
     public void Dispose()

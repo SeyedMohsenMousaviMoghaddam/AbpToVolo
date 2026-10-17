@@ -85,7 +85,8 @@ public static class ZeroMappings
         [ZeroKind.TenantManager] = new("ITenantManager", "Volo.Abp.TenantManagement"),
         [ZeroKind.UserStore] = new("IdentityUserStore", "Volo.Abp.Identity"),
         [ZeroKind.RoleStore] = new("IdentityRoleStore", "Volo.Abp.Identity"),
-        [ZeroKind.LogInManager] = new("AbpSignInManager", "Volo.Abp.Identity.AspNetCore"),
+        // LogInManager.LoginAsync(...) → AbpLoginResult: the generated compatibility class (CompatShimStep), in the solution root namespace.
+        [ZeroKind.LogInManager] = new("LogInManager", ""),
         [ZeroKind.SignInManager] = new("AbpSignInManager", "Volo.Abp.Identity.AspNetCore"),
         [ZeroKind.ClaimsPrincipalFactory] = new("AbpUserClaimsPrincipalFactory", "Volo.Abp.Identity"),
         [ZeroKind.PermissionChecker] = new("IPermissionChecker", "Volo.Abp.Authorization.Permissions"),
@@ -117,7 +118,7 @@ public static class ZeroMappings
     /// <summary>Zero-only infrastructure: code using these (unresolved) names cannot compile on ABP.io and is moved to the legacy folder.</summary>
     public static readonly HashSet<string> LegacyTriggers = new(StringComparer.Ordinal)
     {
-        "AbpLoginResult", "AbpLoginResultType", "UserLoginAttempt", "UserLoginAttemptResult", "Edition", "AbpEditionManager",
+        "UserLoginAttempt", "UserLoginAttemptResult", "Edition", "AbpEditionManager",
         "IdentityRegistrar", "AbpUserConfigurationBuilder", "AbpZeroDbMigrator", "IAbpZeroDbMigrator", "AbpCommonHub",
         "IOnlineClientManager", "OnlineClientManager", "DefaultEditionCreator", "AbpZeroTemplateConsts", "AbpZeroDbContext",
         "IAbpZeroConfig", "AbpZeroSettingNames", "ImpersonationManager", "IUserTokenExpirationValidator"
@@ -228,6 +229,16 @@ public static class ZeroMappings
             // Boilerplate tenants have TenancyName (identifier) and Name (display name): ABP.io has only Name. The display name
             // stays Name (the code reading tenant.Name keeps its meaning), TenancyName is kept as an extension.
             [ZeroKind.Tenant] = [("TenancyName", "string", null), ("IsActive", "bool", "true")],
+        };
+
+    /// <summary>
+    /// Module Zero columns of entities that ABP.io cannot extend (not IHasExtraProperties): kept as EF Core shadow properties
+    /// on the same column (ABP entity → (property, C# type)). The code reads/writes them with EntityShadowProperties.
+    /// </summary>
+    public static readonly IReadOnlyDictionary<string, (string Name, string Type)[]> MissingEntityColumns =
+        new Dictionary<string, (string, string)[]>(StringComparer.Ordinal)
+        {
+            ["IdentityUserToken"] = [("ExpireDate", "DateTime?")],
         };
 
     /// <summary>Base class of each entity kind, for the inherited constants (ZeroConstants table).</summary>

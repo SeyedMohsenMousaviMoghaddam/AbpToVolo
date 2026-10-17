@@ -142,6 +142,8 @@ git merge converted           # فقط تعارض‌های واقعی می‌م�
 
 Extensionهایی که داخل کوئری‌های EF Core خوانده می‌شوند (`GetProperty`، `GetLegacyId()`) به SQL ترجمه نمی‌شوند. بعد از اینکه solution کامپایل شد، این موارد با کمک semantic model پروژه‌های تبدیل‌شده (با referenceهای واقعی‌شان) به `EF.Property<T>(x, "Name")` تبدیل می‌شوند.
 
+DTOها و مدل‌ها نوع شناسه مبدا را نگه می‌دارند (تنانت `int` و کاربر `long`) تا API تغییر نکند؛ Entityها شناسه‌های ABP.io (Guid) را دارند. هر جا این دو به هم می‌رسند (`entity.TenantId == input.TenantId`، `dto.UserId = user.Id`، `CurrentTenant.Id`…)، اصلاح‌های مبتنی بر کامپایلر `LegacyTenantIds.ToTenantGuid / ToLegacyTenantId` و `LegacyUserIds.ToUserGuid / ToLegacyUserId` را اضافه می‌کنند (در Domain.Shared؛ با cache، و از `LegacyId` در دیتابیس خوانده می‌شوند).
+
 ### API وب (`--api-style`)
 
 همه endpointهای مبدا با همان مسیر و همان HTTP verb باقی می‌مانند تا فرانت بدون تغییر کار کند:
@@ -153,6 +155,11 @@ Extensionهایی که داخل کوئری‌های EF Core خوانده می‌
 
   `[DontWrapResult]` و `[WrapResult]` همچنان کار می‌کنند (نوع‌های سازگاری در Domain.Shared). endpointهای ماژول‌های ABP.io (`/api/abp/…`، `/api/identity/…`، `/connect/token`) تغییری نمی‌کنند.
 - `--verify-host` endpointهای مبدا (با قواعد Boilerplate) را با `swagger.json` تبدیل‌شده مقایسه می‌کند و endpointهای گم‌شده و verbهای تغییرکرده را در بخش «Endpoints of the source» گزارش فهرست می‌کند.
+- لاگین TokenAuth همچنان کار می‌کند:
+  - `TokenAuthConfiguration` و پیکربندی‌اش باقی می‌مانند و به‌صورت singleton ثبت می‌شوند.
+  - Host توکن JWT آن را در کنار OpenIddict می‌پذیرد (`BoilerplateJwtBearer`: توکن‌های امضاشده‌ی issuer تنظیم‌شده، و `enc_auth_token` برای SignalR).
+  - سرویس‌های لاگین Boilerplate روی ABP.io ساخته می‌شوند: `LogInManager.LoginAsync` → `AbpLoginResult` (با IdentityUserManager و همان hash رمزها)، `AbpLoginResultTypeHelper`، `ITenantCache`، `IClientInfoProvider`، `SimpleStringCipher` (همان الگوریتم و پیش‌فرض‌ها) و متدهای `ISettingManager` شامل `GetSettingValueForApplication<T>` و `…ForTenant` و `…ForUser` و `ChangeSettingFor…`.
+- محلی‌سازی: `LocalizationManager.GetAllSources()` و `GetSource(name)` (نام، `GetString`، `GetAllStrings(culture)`) روی منابع محلی‌سازی ABP.io.
 
 ### Viewهای SQL
 

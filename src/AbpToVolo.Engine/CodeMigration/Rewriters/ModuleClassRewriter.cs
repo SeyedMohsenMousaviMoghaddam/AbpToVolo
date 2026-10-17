@@ -104,6 +104,11 @@ public sealed partial class ModuleClassRewriter : MigrationRewriter
         var nl = Context.NewLine;
         var updated = module.ReplaceNodes(tokenAuth.Cast<SyntaxNode>().Concat(applicationParts), (original, rewritten) =>
         {
+            if (rewritten is MethodDeclarationSyntax keep && Context.ApiStyle == AbpToVolo.Core.ApiStyleMode.Boilerplate)
+            {
+                return KeepTokenAuthConfiguration(module, keep);
+            }
+
             if (rewritten is MethodDeclarationSyntax method)
             {
                 Context.Change($"Module {module.Identifier.Text}: {method.Identifier.Text}() — Boilerplate JWT configuration removed (ABP.io uses OpenIddict)");
@@ -124,6 +129,43 @@ public sealed partial class ModuleClassRewriter : MigrationRewriter
                 .WithTrailingTrivia(statement.GetTrailingTrivia());
         });
         return updated;
+    }
+
+    /// <summary>
+    /// --api-style boilerplate: the TokenAuth login keeps issuing its JWT. IocManager.Register&lt;TokenAuthConfiguration&gt;() +
+    /// Resolve → new TokenAuthConfiguration() { ... } registered as a singleton (ServiceConfigurationContext.Services).
+    /// </summary>
+    private MethodDeclarationSyntax KeepTokenAuthConfiguration(ClassDeclarationSyntax module, MethodDeclarationSyntax method)
+    {
+        var statements = new List<StatementSyntax>();
+        string? variable = null;
+        foreach (var statement in method.Body!.Statements)
+        {
+            var text = statement.ToString();
+            if (text.Contains("TokenAuthConfiguration>", StringComparison.Ordinal) &&
+                statement is ExpressionStatementSyntax && (text.Contains("Register", StringComparison.Ordinal) || text.Contains(".Add", StringComparison.Ordinal)))
+            {
+                continue; // registration: done below with the configured instance
+            }
+
+            if (statement is LocalDeclarationStatementSyntax { Declaration.Variables: [{ Initializer: { } initializer } declarator] } local &&
+                initializer.Value.ToString().Contains("TokenAuthConfiguration>", StringComparison.Ordinal))
+            {
+                variable = declarator.Identifier.Text;
+                statements.Add(local.ReplaceNode(initializer.Value, ParseExpression("new TokenAuthConfiguration()").WithTriviaFrom(initializer.Value)));
+                continue;
+            }
+
+            statements.Add(statement);
+        }
+
+        if (variable is null) return method;
+        var indent = statements.Count > 0 ? SyntaxHelpers.Indentation(statements[0]) : SyntaxHelpers.Indentation(method) + "    ";
+        statements.Add(ParseStatement($"ServiceConfigurationContext.Services.AddSingleton({variable});")
+            .WithLeadingTrivia(Whitespace(indent)).WithTrailingTrivia(EndOfLine(Context.NewLine)));
+        Context.RequireUsing("Microsoft.Extensions.DependencyInjection");
+        Context.Change($"Module {module.Identifier.Text}: {method.Identifier.Text}() — TokenAuthConfiguration kept (Boilerplate JWT login), registered as a singleton");
+        return method.WithBody(method.Body.WithStatements(List(statements)));
     }
 
     /// <summary>base.PreInitialize(); etc.: the Boilerplate base methods are gone (ABP.io's are empty).</summary>

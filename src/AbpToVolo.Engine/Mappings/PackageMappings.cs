@@ -85,6 +85,7 @@ public static class PackageMappings
         ("Volo.Abp.Features", "Volo.Abp.Features", null),
         ("Volo.Abp.Threading", "Volo.Abp.Threading", null),
         ("Volo.Abp.ObjectExtending", "Volo.Abp.ObjectExtending", null),
+        ("Volo.Abp.Identity.AspNetCore", "Volo.Abp.Identity.AspNetCore", null),
         ("Volo.Abp.Identity", "Volo.Abp.Identity.Domain", null),
         ("Volo.Abp.TenantManagement", "Volo.Abp.TenantManagement.Domain", null),
         ("Volo.Abp.PermissionManagement", "Volo.Abp.PermissionManagement.Domain", null),

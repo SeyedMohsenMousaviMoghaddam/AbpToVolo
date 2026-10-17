@@ -27,6 +27,7 @@ public static class CSharpFileMigrator
         c => new RepositoryCallRewriter(c),
         c => new ServiceMembersRewriter(c),
         c => new LocalizationRewriter(c),
+        c => new ExceptionRewriter(c),
         c => new AttributeRewriter(c),
         c => new TypeNameRewriter(c),
         c => new UsingsRewriter(c),

@@ -1,3 +1,4 @@
+using AbpToVolo.Core;
 using AbpToVolo.Mappings;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
@@ -133,7 +134,27 @@ public sealed class TypeNameRewriter : MigrationRewriter
             return visited.WithType(NullableType(IdentifierName("Guid")).WithTriviaFrom(visited.Type));
         }
 
-        return GuidId(name, visited.Type) is { } guid ? visited.WithType(guid) : visited;
+        return GuidId(name, visited.Type, entityProperty: IsEntityClass(node.Parent as ClassDeclarationSyntax)) is { } guid ? visited.WithType(guid) : visited;
+    }
+
+    /// <summary>
+    /// An entity (its TenantId column follows the ABP.io standard, Guid): a multi-tenant or entity base type, or a class of
+    /// the domain layer that is not a DTO/model.
+    /// </summary>
+    private bool IsEntityClass(ClassDeclarationSyntax? cls)
+    {
+        if (cls is null) return false;
+        if (SyntaxHelpers.HasBaseType(cls, "IMayHaveTenant", "IMustHaveTenant", "IMultiTenant")) return true;
+        if (cls.BaseList?.Types.Any(t => SyntaxHelpers.SimpleName(t.Type) is var b &&
+                (b.Contains("Entity", StringComparison.Ordinal) || b.Contains("AggregateRoot", StringComparison.Ordinal) || b.Contains("Audited", StringComparison.Ordinal))) == true)
+        {
+            return true;
+        }
+
+        var name = cls.Identifier.Text;
+        var dto = name.EndsWith("Dto", StringComparison.Ordinal) || name.EndsWith("Input", StringComparison.Ordinal) || name.EndsWith("Output", StringComparison.Ordinal) ||
+                  name.EndsWith("Model", StringComparison.Ordinal) || name.EndsWith("Request", StringComparison.Ordinal) || name.EndsWith("Response", StringComparison.Ordinal);
+        return Context.Project?.Layer == ProjectLayer.Domain && !dto;
     }
 
     /// <summary>
@@ -141,10 +162,14 @@ public sealed class TypeNameRewriter : MigrationRewriter
     /// named *TenantId (int) or *UserId (long) are converted, so the code stays consistent with CurrentTenant.Id,
     /// CurrentUser.Id and IdentityUser.Id. The database columns are migrated with Zero_IdMap (ModuleZeroDataMigration.sql).
     /// </summary>
-    private TypeSyntax? GuidId(string name, TypeSyntax type)
+    private TypeSyntax? GuidId(string name, TypeSyntax type, bool entityProperty = false)
     {
         var text = SyntaxHelpers.Text(type);
         if (ZeroMappings.GuidIdKind(name, text, Context.IdType) is not { } kind) return null;
+
+        // --id-type source: only the entities' TenantId columns follow ABP.io (Guid); DTOs, models, parameters and variables
+        // keep the int tenant ids of the source (the API does not change), converted with LegacyTenantIds where they meet.
+        if (kind == "Tenant" && Context.IdType == IdTypeMode.Source && !entityProperty) return null;
 
         Context.RequireUsing("System");
         Context.Change($"{name}: {text} → Guid{(text.EndsWith('?') ? "?" : "")} (ABP.io {kind} ids are Guid)");

@@ -37,6 +37,7 @@ public sealed class MigrationEngine
         new ContractsStep(),           // needs the converted code (PermissionDefinitionProvider, [AutoMap]...)
         new AbpModulesStep(),          // Identity/Account/OpenIddict/... module dependencies, DbContext integration
         new LegacyIdStep(),            // --id-type source: LegacyId on IdentityUser/IdentityRole, principal keys, helpers
+        new ZeroColumnsStep(),         // Module Zero columns ABP.io entities lack (UserToken.ExpireDate) as shadow properties
         new LayerServicesStep(),       // framework services each layer injects (HttpClient, SignalR)
         new HostStandardizationStep(), // ABP.io HttpApi.Host (module + Program.cs) and DbMigrator
         new BoilerplateApiStep(),      // --api-style boilerplate: /api/services/app routes, AjaxResponse envelope

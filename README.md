@@ -137,6 +137,8 @@ Tenants: Boilerplate has `TenancyName` (identifier) and `Name` (display name), A
 
 Entity extensions (`GetProperty`, `GetLegacyId()`) read inside EF Core queries cannot be translated to SQL: once the solution compiles, they are rewritten to `EF.Property<T>(x, "Name")`, using the semantic model of the converted projects with their real references.
 
+DTOs and models keep the source id types (tenant `int`, user `long`), so the API does not change; the entities use the ABP.io ids (Guid). Where the two meet (`entity.TenantId == input.TenantId`, `dto.UserId = user.Id`, `CurrentTenant.Id`…), the compiler-guided fixes insert `LegacyTenantIds.ToTenantGuid / ToLegacyTenantId` and `LegacyUserIds.ToUserGuid / ToLegacyUserId` (Domain.Shared; cached, resolved from `LegacyId` in the database).
+
 ### HTTP API (`--api-style`)
 
 Every endpoint of the source stays, at the same path and HTTP verb, so the front end keeps working:
@@ -144,6 +146,8 @@ Every endpoint of the source stays, at the same path and HTTP verb, so the front
 - Application services and controllers are never moved to the legacy folder, even the template ones (`UserAppService`, `TenantAppService`, `SessionAppService`, `TokenAuthController`…). What does not compile is stubbed member by member (a constructor parameter or field that does not resolve is removed, an unknown type in a signature becomes `object`, a method body throws `NotImplementedException`), so the route exists and the report lists what to finish.
 - `boilerplate` (default) generates `BoilerplateApi` in the HttpApi project: an `IConventionalRouteBuilder` replacement for the `/api/services/app/{Service}/{Action}` routes (same verb rules: `Get…` → GET, `Update…` → PUT, `Delete…` → DELETE, otherwise POST), and a result filter that returns results, errors (`RemoteServiceErrorResponse`) and 401/403 answers as `{ result, targetUrl, success, error, unAuthorizedRequest, __abp }`. `[DontWrapResult]`/`[WrapResult]` keep working (compatibility types in Domain.Shared). The ABP.io module endpoints (`/api/abp/…`, `/api/identity/…`, `/connect/token`) are unchanged.
 - `--verify-host` compares the endpoints of the source (Boilerplate conventions) with the converted `swagger.json` and lists the missing ones and the changed verbs ("Endpoints of the source" in the report).
+- The TokenAuth login keeps working: `TokenAuthConfiguration` and its configuration stay (registered as a singleton), the host accepts its JWT next to OpenIddict (`BoilerplateJwtBearer`: signed tokens of the configured issuer, and `enc_auth_token` for SignalR), and the Boilerplate login services are generated on top of ABP.io: `LogInManager.LoginAsync` → `AbpLoginResult` (IdentityUserManager, same password hashes), `AbpLoginResultTypeHelper`, `ITenantCache`, `IClientInfoProvider`, `SimpleStringCipher` (same algorithm and defaults) and the `ISettingManager` methods `GetSettingValueForApplication<T>` / `…ForTenant` / `…ForUser` / `ChangeSettingFor…`.
+- Localization: `LocalizationManager.GetAllSources()` / `GetSource(name)` (name, `GetString`, `GetAllStrings(culture)`) over the ABP.io localization resources.
 
 ### SQL views
 

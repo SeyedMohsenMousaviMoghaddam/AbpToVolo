@@ -33,6 +33,30 @@ public class ModelRewriterTests : RewriterTestBase
     }
 
     [Fact]
+    public void User_friendly_exception_arguments_keep_their_meaning()
+    {
+        const string source = """
+            using Abp.UI;
+            public class X
+            {
+                public void A(string m) => throw new UserFriendlyException(L("Error"), L("ItemWasNotFound"));
+                public void B() => throw new UserFriendlyException(404, "Not found", "No such item");
+                public void C(System.Exception ex) => throw new UserFriendlyException("Failed", ex);
+                public void D() => throw new UserFriendlyException("Only a message");
+                private string L(string s) => s;
+            }
+            """;
+
+        var (code, _) = Migrate(source);
+
+        // ABP.io: (message, code, details, innerException): the Boilerplate details must not become the error code.
+        AssertContains("new UserFriendlyException(L(\"Error\"), details: L(\"ItemWasNotFound\"))", code);
+        AssertContains("new UserFriendlyException(\"Not found\", code: \"404\", details: \"No such item\")", code);
+        AssertContains("new UserFriendlyException(\"Failed\", ex)", code); // innerException: by the compiler-guided fixes (types known)
+        AssertContains("new UserFriendlyException(\"Only a message\")", code);
+    }
+
+    [Fact]
     public void Attributes_are_converted()
     {
         const string source = """

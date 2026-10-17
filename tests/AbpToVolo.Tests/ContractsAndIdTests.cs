@@ -1,3 +1,4 @@
+using AbpToVolo.Core;
 using AbpToVolo.Steps;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
@@ -55,7 +56,10 @@ public class ContractsAndIdTests : RewriterTestBase
         AssertContains("public class Invoice : Entity<long>, IMultiTenant", code);
         AssertContains("public Guid? TenantId { get; set; }", code);
         AssertContains("public Guid? CreatorId { get; set; }", code);
-        Assert.DoesNotContain("int? TenantId", code); // DTO tenant ids follow the entity (Guid)
+        // --id-type source (default): the DTO keeps the int tenant id of the source (the API does not change);
+        // --id-type guid: it follows the entity.
+        AssertContains("public int? TenantId { get; set; }", code);
+        Assert.DoesNotContain("int? TenantId", Migrate(source, idType: IdTypeMode.Guid).Code);
     }
 
     [Theory]

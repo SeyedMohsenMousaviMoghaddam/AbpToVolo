@@ -115,6 +115,12 @@ public sealed class MigrationContext
     /// <summary>Former custom properties of Zero entities, now extra properties: ABP type name → (property → C# type).</summary>
     public Dictionary<string, Dictionary<string, string>> ExtensionProperties { get; } = new(StringComparer.Ordinal);
 
+    /// <summary>
+    /// Former navigations of Zero entities to the solution's entities (User.People → People through PeopleId): ABP type
+    /// name → (navigation → target). ABP.io entities cannot have them; the code reads the target through its foreign key.
+    /// </summary>
+    public Dictionary<string, Dictionary<string, ZeroNavigation>> ZeroNavigations { get; } = new(StringComparer.Ordinal);
+
     /// <summary>Projects whose code (or packages) referenced Module Zero.</summary>
     public HashSet<string> ProjectsUsingZero { get; } = new(StringComparer.OrdinalIgnoreCase);
 
@@ -161,3 +167,6 @@ public sealed class MigrationContext
 
     public void Verbose(string message) => Observer.Log(LogLevel.Detail, message);
 }
+
+/// <summary>A navigation of a Zero entity to a solution entity: target type (fully qualified), foreign key property and its type.</summary>
+public sealed record ZeroNavigation(string TargetType, string ForeignKey, string ForeignKeyType);

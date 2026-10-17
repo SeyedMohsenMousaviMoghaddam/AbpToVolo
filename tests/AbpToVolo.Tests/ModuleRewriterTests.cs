@@ -264,12 +264,21 @@ public class ModuleRewriterTests : RewriterTestBase
             }
             """;
 
-        var (code, _) = Migrate(source);
+        // --api-style abp: OpenIddict only, the JWT configuration goes.
+        var (code, _) = Migrate(source, apiStyle: ApiStyleMode.Abp);
 
         Assert.DoesNotContain("tokenAuthConfig.Issuer", code);
         AssertContains("is replaced by OpenIddict in ABP.io", code);
         Assert.DoesNotContain(".AddApplicationPartsIfNotAddedBefore(typeof(", code);
         AssertContains("ConfigureTokenAuth();", code);
+
+        // --api-style boilerplate (default): the TokenAuth login keeps its JWT configuration, registered as a singleton.
+        var (kept, _) = Migrate(source);
+        AssertContains("var tokenAuthConfig = new TokenAuthConfiguration();", kept);
+        AssertContains("tokenAuthConfig.Issuer = \"x\";", kept);
+        AssertContains("ServiceConfigurationContext.Services.AddSingleton(tokenAuthConfig);", kept);
+        Assert.DoesNotContain("AddSingleton<TokenAuthConfiguration>", kept);
+        Assert.DoesNotContain("GetRequiredService<TokenAuthConfiguration>", kept);
     }
 
     [Fact]

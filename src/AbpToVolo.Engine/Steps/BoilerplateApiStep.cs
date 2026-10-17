@@ -49,6 +49,7 @@ public sealed class BoilerplateApiStep : IMigrationStep
         FileSystem.WriteText(mvc, MvcCode(ns));
         var wired = Wire(context, httpApi, ProjectLayer.HttpApi, $"global::{ns}.BoilerplateApi.ConfigureServices(context.Services);");
         AddTenantIdResolver(context, ns);
+        AddJwtBearer(context, ns, sources);
 
         context.Report.Change(Name, "Application services keep the Boilerplate routes /api/services/app/{Service}/{Action}; results, errors and 401/403 " +
                                     "answers keep the AjaxResponse envelope ([DontWrapResult] respected)", context.Relative(mvc));
@@ -80,6 +81,114 @@ public sealed class BoilerplateApiStep : IMigrationStep
             context.Report.Todo(Name, "Add BoilerplateTenantIdResolveContributor to AbpTenantResolveOptions.TenantResolvers in the host module.", context.Relative(file));
         }
     }
+
+    /// <summary>
+    /// The TokenAuth login of the source issues its own JWT (TokenAuthConfiguration, Authentication:JwtBearer settings):
+    /// the host accepts it next to OpenIddict — a JWT bearer scheme, chosen for 3-part tokens of that issuer (OpenIddict
+    /// access tokens are encrypted, 5 parts), and enc_auth_token (SignalR) decrypted with SimpleStringCipher.
+    /// </summary>
+    private void AddJwtBearer(MigrationContext context, string ns, List<string> sources)
+    {
+        if (!sources.Any(s => s.Contains("class TokenAuthConfiguration", StringComparison.Ordinal))) return;
+        if (context.FindProject(ProjectLayer.Host) is not { } host) return;
+
+        CompatShimStep.EnsureShim(context, CompatShimStep.SimpleStringCipherFile);
+        var file = Path.Combine(host.Directory, CompatShimStep.ShimFolder, "BoilerplateJwtBearer.cs");
+        FileSystem.WriteText(file, JwtBearerCode(ns));
+        var wired = Wire(context, host, ProjectLayer.Host, $"global::{ns}.BoilerplateJwtBearer.Configure(context.Services, context.Services.GetConfiguration());");
+        context.Report.Change(Name, "Tokens of the TokenAuth login (JWT of Authentication:JwtBearer) are accepted next to OpenIddict (BoilerplateJwtBearer)", context.Relative(file));
+        if (!wired)
+        {
+            context.Report.Todo(Name, "Call BoilerplateJwtBearer.Configure(context.Services, configuration) in ConfigureServices of the host module.", context.Relative(file));
+        }
+    }
+
+    internal static string JwtBearerCode(string ns) => $$"""
+        // AbpToVolo: the JWT of the Boilerplate TokenAuth login (TokenAuthConfiguration, settings Authentication:JwtBearer)
+        // is accepted next to OpenIddict, so the existing front end keeps logging in with /api/TokenAuth/...
+        using System;
+        using System.Linq;
+        using System.Text;
+        using System.Threading.Tasks;
+        using Microsoft.AspNetCore.Authentication.Cookies;
+        using Microsoft.AspNetCore.Authentication.JwtBearer;
+        using Microsoft.AspNetCore.Http;
+        using Microsoft.AspNetCore.Identity;
+        using Microsoft.Extensions.Configuration;
+        using Microsoft.Extensions.DependencyInjection;
+        using Microsoft.IdentityModel.Tokens;
+        using Volo.Abp.Security.Claims;
+
+        namespace {{ns}};
+
+        public static class BoilerplateJwtBearer
+        {
+            public const string Scheme = "BoilerplateJwtBearer";
+
+            public static void Configure(IServiceCollection services, IConfiguration configuration)
+            {
+                var settings = configuration.GetSection("Authentication:JwtBearer");
+                var key = settings["SecurityKey"];
+                if (string.IsNullOrEmpty(key) || string.Equals(settings["IsEnabled"], "false", StringComparison.OrdinalIgnoreCase)) return;
+                var issuer = settings["Issuer"];
+
+                services.AddAuthentication().AddJwtBearer(Scheme, options =>
+                {
+                    options.MapInboundClaims = false; // the claims keep the names the ABP.io claims principal factory gave them
+                    options.RequireHttpsMetadata = false;
+                    options.TokenValidationParameters = new TokenValidationParameters
+                    {
+                        ValidateIssuerSigningKey = true,
+                        IssuerSigningKey = new SymmetricSecurityKey(Encoding.ASCII.GetBytes(key)),
+                        ValidateIssuer = true,
+                        ValidIssuer = issuer,
+                        ValidateAudience = true,
+                        ValidAudience = settings["Audience"],
+                        ValidateLifetime = true,
+                        ClockSkew = TimeSpan.Zero,
+                        NameClaimType = AbpClaimTypes.UserName,
+                        RoleClaimType = AbpClaimTypes.Role
+                    };
+                    options.Events = new JwtBearerEvents
+                    {
+                        // SignalR clients of Boilerplate send the encrypted token in the query string.
+                        OnMessageReceived = context =>
+                        {
+                            var encrypted = context.Request.Query["enc_auth_token"].FirstOrDefault();
+                            if (!string.IsNullOrEmpty(encrypted)) context.Token = SimpleStringCipher.Instance.Decrypt(encrypted);
+                            return Task.CompletedTask;
+                        }
+                    };
+                });
+
+                // ABP.io forwards bearer requests of the Identity cookie scheme to OpenIddict; Boilerplate tokens go to this scheme.
+                services.PostConfigure<CookieAuthenticationOptions>(IdentityConstants.ApplicationScheme, options =>
+                {
+                    var previous = options.ForwardDefaultSelector;
+                    options.ForwardDefaultSelector = context => IsBoilerplateToken(context, issuer) ? Scheme : previous?.Invoke(context);
+                });
+            }
+
+            /// <summary>A signed JWT (3 parts) of the TokenAuth issuer, or enc_auth_token; OpenIddict access tokens are encrypted (5 parts).</summary>
+            private static bool IsBoilerplateToken(HttpContext context, string? issuer)
+            {
+                if (context.Request.Query.ContainsKey("enc_auth_token")) return true;
+                string? authorization = context.Request.Headers.Authorization;
+                if (authorization is null || !authorization.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase)) return false;
+                var parts = authorization["Bearer ".Length..].Trim().Split('.');
+                if (parts.Length != 3) return false;
+                try
+                {
+                    return issuer is null || Base64UrlEncoder.Decode(parts[1]).Contains($"\"iss\":\"{issuer}\"", StringComparison.Ordinal);
+                }
+                catch (FormatException)
+                {
+                    return false;
+                }
+            }
+        }
+
+        """;
 
     internal static string TenantResolverCode(string ns) => $$"""
         // AbpToVolo: Boilerplate clients send the tenant as the "Abp.TenantId" header (or cookie) with the int id of the
@@ -296,7 +405,10 @@ public sealed class BoilerplateApiStep : IMigrationStep
         using Microsoft.Extensions.DependencyInjection;
         using Microsoft.Extensions.DependencyInjection.Extensions;
         using Microsoft.Extensions.Options;
+        using System.Net;
+        using Volo.Abp.AspNetCore.ExceptionHandling;
         using Volo.Abp.AspNetCore.Mvc.Conventions;
+        using Volo.Abp.Authorization;
         using Volo.Abp.DependencyInjection;
         using Volo.Abp.Http;
 
@@ -380,6 +492,33 @@ public sealed class BoilerplateApiStep : IMigrationStep
                 action.ActionMethod.Name == "GetListAsync" && type.GetInterfaces().Any(i => i.IsGenericType && i.GetGenericTypeDefinition().Name.StartsWith("IReadOnlyAppService", StringComparison.Ordinal))
                     ? "GetAll"
                     : action.ActionName;
+        }
+
+        /// <summary>
+        /// Boilerplate's HTTP status codes for the solution's actions: user-friendly and business errors are 500 (ABP.io: 403);
+        /// only authorization errors are 401/403 (unAuthorizedRequest = true), validation 400, not found 404.
+        /// </summary>
+        [Dependency(ReplaceServices = true)]
+        [ExposeServices(typeof(IHttpExceptionStatusCodeFinder))]
+        public class BoilerplateHttpExceptionStatusCodeFinder : DefaultHttpExceptionStatusCodeFinder
+        {
+            public BoilerplateHttpExceptionStatusCodeFinder(IOptions<AbpExceptionHttpStatusCodeOptions> options)
+                : base(options)
+            {
+            }
+
+            public override HttpStatusCode GetStatusCode(HttpContext httpContext, Exception exception)
+            {
+                var status = base.GetStatusCode(httpContext, exception);
+                var action = httpContext.GetEndpoint()?.Metadata.GetMetadata<ControllerActionDescriptor>();
+                if (status == HttpStatusCode.Forbidden && exception is not AbpAuthorizationException &&
+                    action is not null && !BoilerplateApi.IsFrameworkType(action.ControllerTypeInfo.AsType()))
+                {
+                    return HttpStatusCode.InternalServerError;
+                }
+
+                return status;
+            }
         }
 
         /// <summary>Results and errors of the solution's actions → AjaxResponse (also runs for the results of exception filters).</summary>

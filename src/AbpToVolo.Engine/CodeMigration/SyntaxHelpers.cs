@@ -9,6 +9,9 @@ public static class SyntaxHelpers
 {
     public const string TodoPrefix = "TODO [AbpToVolo]: ";
 
+    /// <summary>"name: " (named argument, with the usual space after the colon).</summary>
+    public static NameColonSyntax NamedArgument(string name) => NameColon(IdentifierName(name), Token(SyntaxKind.ColonToken).WithTrailingTrivia(Space));
+
     /// <summary>
     /// new { x.A } → new { Name = value }, keeping the layout: the line break / indentation in front of the member moves to
     /// the name, and " = " separates it from the value.

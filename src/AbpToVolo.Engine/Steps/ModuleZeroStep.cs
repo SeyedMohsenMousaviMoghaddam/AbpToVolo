@@ -65,6 +65,10 @@ public sealed class ModuleZeroStep : IMigrationStep
         {
             CollectMembers(zero, model);
             AddMissingBaseProperties(zero);
+            if (zero.Replacement is { } navigationOwner && CollectNavigations(zero) is { Count: > 0 } navigations)
+            {
+                context.ZeroNavigations[navigationOwner.Name] = navigations;
+            }
             if (zero.Replacement is { } replacement && zero.Properties.Count > 0)
             {
                 context.ExtensionProperties[replacement.Name] = zero.Properties.ToDictionary(p => p.Name, p => p.Type, StringComparer.Ordinal);
@@ -159,6 +163,34 @@ public sealed class ModuleZeroStep : IMigrationStep
         }
     }
 
+    /// <summary>
+    /// Navigations of the Zero entity to the solution's entities ("public People People" with [ForeignKey("PeopleId")] or a
+    /// PeopleId property) whose foreign key became an entity extension: the code keeps reading them through the key.
+    /// </summary>
+    private static Dictionary<string, ZeroNavigation> CollectNavigations(ZeroClass zero)
+    {
+        var result = new Dictionary<string, ZeroNavigation>(StringComparer.Ordinal);
+        foreach (var property in zero.Symbol.GetMembers().OfType<IPropertySymbol>())
+        {
+            if (property.IsStatic || property.Type is not INamedTypeSymbol { TypeKind: TypeKind.Class } target ||
+                target.Locations.All(l => !l.IsInSource) || target.SpecialType != SpecialType.None)
+            {
+                continue;
+            }
+
+            static string? ForeignKeyName(AttributeData? attribute) => attribute?.ConstructorArguments.FirstOrDefault().Value as string;
+            var onNavigation = ForeignKeyName(property.GetAttributes().FirstOrDefault(a => a.AttributeClass?.Name == "ForeignKeyAttribute"));
+            var onKey = zero.Symbol.GetMembers().OfType<IPropertySymbol>()
+                .FirstOrDefault(p => ForeignKeyName(p.GetAttributes().FirstOrDefault(a => a.AttributeClass?.Name == "ForeignKeyAttribute")) == property.Name)?.Name;
+            var foreignKey = (onNavigation ?? onKey ?? property.Name + "Id").Split(',')[0].Trim();
+            if (zero.Properties.FirstOrDefault(p => p.Name == foreignKey) is not { } key) continue;
+
+            result[property.Name] = new ZeroNavigation(target.ToDisplayString(), foreignKey, key.Type);
+        }
+
+        return result;
+    }
+
     private static void CollectMembers(ZeroClass zero, SolutionModel model)
     {
         foreach (var member in zero.Symbol.GetMembers())
@@ -239,6 +271,8 @@ public sealed class ModuleZeroStep : IMigrationStep
             var template = root.DescendantNodes().OfType<BaseTypeDeclarationSyntax>()
                 .Where(t => ZeroMappings.IsTemplateClass(t.Identifier.Text,
                     t.Ancestors().OfType<BaseNamespaceDeclarationSyntax>().FirstOrDefault() is { } ns ? SolutionModel.FullNamespace(ns) : null))
+                // --api-style boilerplate: the TokenAuth login keeps issuing its JWT (BoilerplateApiStep accepts it).
+                .Where(t => !(context.Options.ApiStyle == ApiStyleMode.Boilerplate && t.Identifier.Text == "TokenAuthConfiguration"))
                 .Select(t => t.Identifier.Text)
                 .FirstOrDefault();
             if (template is not null)
@@ -720,6 +754,16 @@ public sealed class ModuleZeroStep : IMigrationStep
             var visited = (GenericNameSyntax)base.VisitGenericName(node)!;
             var args = node.TypeArgumentList.Arguments;
 
+            // AbpUserStore<Role, User> / AbpRoleStore<Role, User> (Module Zero generic stores) → IdentityUserStore / IdentityRoleStore
+            if (model.GetSymbolInfo(node).Symbol is null && node.Identifier.Text is "AbpUserStore" or "AbpRoleStore")
+            {
+                var store = node.Identifier.Text == "AbpUserStore" ? "IdentityUserStore" : "IdentityRoleStore";
+                Changed = true;
+                Usings.Add("Volo.Abp.Identity");
+                Changes.Add($"{node} → {store}");
+                return IdentifierName(store).WithTriviaFrom(node);
+            }
+
             // IRepository<UserRole, long> → IRepository<IdentityUserRole>: these ABP.io Identity entities have composite keys.
             if (args.Count == 2 && args[0] is IdentifierNameSyntax framework && model.GetSymbolInfo(framework).Symbol is null &&
                 framework.Identifier.Text is "UserRole" or "UserLogin" or "UserToken" or "UserOrganizationUnit" or "OrganizationUnitRole")
@@ -869,6 +913,15 @@ public sealed class ModuleZeroStep : IMigrationStep
 
         public override SyntaxNode? VisitObjectCreationExpression(ObjectCreationExpressionSyntax node)
         {
+            // new UserIdentifier(tenantId, userId) → userId: ABP.io identifies a user by its id alone (user settings, notifications...).
+            if (node.Type is IdentifierNameSyntax { Identifier.Text: "UserIdentifier" } && model.GetSymbolInfo(node.Type).Symbol is null &&
+                node.ArgumentList is { Arguments.Count: 2 } userIdentifier)
+            {
+                Changed = true;
+                Changes.Add("new UserIdentifier(tenantId, userId) → userId");
+                return ((ExpressionSyntax)Visit(userIdentifier.Arguments[1].Expression)!).WithTriviaFrom(node);
+            }
+
             if (ZeroOf(model.GetSymbolInfo(node.Type).Symbol) is { } z && ZeroMappings.IsEntity(z.Kind))
             {
                 Todos.Add($"new {z.Symbol.Name}(...) → create {z.Replacement!.Name} with its constructor (Guid id, ...) and set extension properties with SetProperty.");
