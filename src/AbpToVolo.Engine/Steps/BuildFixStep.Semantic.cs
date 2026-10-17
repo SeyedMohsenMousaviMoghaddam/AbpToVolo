@@ -20,7 +20,7 @@ public sealed partial class BuildFixStep
     private const string TenantType = "Volo.Abp.TenantManagement.Tenant";
     private const string LegacyIdProperty = "LegacyId";
 
-    private static readonly HashSet<string> TypeMismatchCodes = new(StringComparer.Ordinal) { "CS0029", "CS0266", "CS0019", "CS1503", "CS0030", "CS0173", "CS1662" };
+    private static readonly HashSet<string> TypeMismatchCodes = new(StringComparer.Ordinal) { "CS0029", "CS0266", "CS0019", "CS1503", "CS0030", "CS0173", "CS1662", "CS1929" };
 
     private static readonly HashSet<string> RepositoryIdMethods = new(StringComparer.Ordinal)
     {
@@ -38,7 +38,8 @@ public sealed partial class BuildFixStep
         var applied = 0;
         var relevant = errors.Where(e => legacyIds && TypeMismatchCodes.Contains(e.Code) ||
                                          e.Code == "CS1061" && MissingMember().Match(e.Message) is { Success: true } m &&
-                                         IsZeroMember(context, m.Groups["type"].Value, m.Groups["member"].Value));
+                                         IsZeroMember(context, m.Groups["type"].Value, m.Groups["member"].Value) ||
+                                         e.Code is "CS7036" or "CS1729" or "CS1995");
         foreach (var group in relevant.GroupBy(e => e.Project, StringComparer.OrdinalIgnoreCase))
         {
             if (context.Projects.FirstOrDefault(p => string.Equals(p.Name, group.Key, StringComparison.OrdinalIgnoreCase)) is not { } project) continue;
@@ -47,6 +48,7 @@ public sealed partial class BuildFixStep
 
             var edits = new Dictionary<SyntaxTree, Dictionary<SyntaxNode, SyntaxNode>>();
             var declarations = new Dictionary<BlockSyntax, List<string>>();
+            var hoists = new Dictionary<StatementSyntax, List<string>>();
             foreach (var error in group)
             {
                 if (!semantic.Trees.TryGetValue(error.File, out var tree)) continue;
@@ -57,10 +59,28 @@ public sealed partial class BuildFixStep
                 var node = tree.GetRoot().FindToken(position).Parent;
                 if (node is null) continue;
 
+                if (error.Code == "CS1995")
+                {
+                    PlanHoistAwait(node, edits, hoists);
+                    continue;
+                }
+
+                if (error.Code is "CS7036" or "CS1729")
+                {
+                    if (node.AncestorsAndSelf().OfType<ConstructorDeclarationSyntax>().FirstOrDefault() is { Initializer: { } } ctor) PlanBaseConstructor(model, ctor, edits);
+                    continue;
+                }
+
                 if (error.Code == "CS1061")
                 {
                     var member = MissingMember().Match(error.Message);
                     PlanZeroMember(context, semantic, model, node, member.Groups["type"].Value, member.Groups["member"].Value, edits, declarations);
+                    continue;
+                }
+
+                if (error.Code == "CS1929")
+                {
+                    PlanLegacyIdCollection(semantic, node, error, edits);
                     continue;
                 }
 
@@ -72,7 +92,7 @@ public sealed partial class BuildFixStep
                 if (edits.Values.Sum(e => e.Count) == before) PlanTenantIdConversion(semantic, model, node, expression, error, edits);
             }
 
-            applied += WriteEdits(context, edits, totals, "source ids ↔ ABP.io ids, Zero navigations and columns (semantic fixes)", declarations);
+            applied += WriteEdits(context, edits, totals, "source ids ↔ ABP.io ids, Zero navigations and columns (semantic fixes)", declarations, hoists);
         }
 
         return applied;
@@ -147,7 +167,9 @@ public sealed partial class BuildFixStep
             // A subquery on the foreign key (EF Core translates it, also .Member and == null after it).
             var variable = $"__{char.ToLowerInvariant(target.Name[0])}{target.Name[1..]}Query";
             if (!declarations.TryGetValue(body, out var list)) declarations[body] = list = [];
-            if (!list.Any(d => d.Contains($" {variable} =", StringComparison.Ordinal))) list.Add($"var {variable} = {Await($"{repository}.GetQueryableAsync()")};");
+            // Declared once per method (also when an earlier round already added it).
+            var declared = body.Statements.OfType<LocalDeclarationStatementSyntax>().Any(s => s.Declaration.Variables.Any(v => v.Identifier.Text == variable));
+            if (!declared && !list.Any(d => d.Contains($" {variable} =", StringComparison.Ordinal))) list.Add($"var {variable} = {Await($"{repository}.GetQueryableAsync()")};");
             Add(edits, access, ParseExpression(
                     $"{variable}.FirstOrDefault(__x => ({navigation.ForeignKeyType.TrimEnd('?')}?)__x.Id == EF.Property<{navigation.ForeignKeyType}>({receiver}, \"{navigation.ForeignKey}\"))")
                 .WithTriviaFrom(access));
@@ -160,6 +182,58 @@ public sealed partial class BuildFixStep
             ? $"({foreignKey} is {{ }} __{navigation.ForeignKey}{access.SpanStart} ? {Await($"{repository}.FindAsync(__{navigation.ForeignKey}{access.SpanStart})")} : null)"
             : $"({Await($"{repository}.FindAsync({foreignKey})")})";
         Add(edits, access, ParseExpression(load).WithTriviaFrom(access));
+    }
+
+    /// <summary>
+    /// CS1995: "await" in a query expression outside its first from / join (the converted _repo.GetAll() → await
+    /// _repo.GetQueryableAsync()): the awaited queryable goes to a local just before the statement (no query runs there).
+    /// </summary>
+    private static void PlanHoistAwait(SyntaxNode node, Dictionary<SyntaxTree, Dictionary<SyntaxNode, SyntaxNode>> edits, Dictionary<StatementSyntax, List<string>> hoists)
+    {
+        if (node.AncestorsAndSelf().OfType<AwaitExpressionSyntax>().FirstOrDefault() is not { } awaited) return;
+        ExpressionSyntax target = awaited.Parent is ParenthesizedExpressionSyntax parenthesized ? parenthesized : awaited;
+        if (target.Ancestors().OfType<StatementSyntax>().FirstOrDefault(s => s.Parent is BlockSyntax) is not { } statement) return;
+
+        var name = $"__query{awaited.SpanStart}";
+        if (!hoists.TryGetValue(statement, out var list)) hoists[statement] = list = [];
+        if (list.Any(s => s.StartsWith($"var {name} ", StringComparison.Ordinal))) return;
+        list.Add($"var {name} = {awaited.WithoutTrivia()};");
+        Add(edits, target, IdentifierName(name).WithTriviaFrom(target));
+    }
+
+    /// <summary>
+    /// A subclass of an ABP.io type (a Zero manager kept as a subclass of IdentityUserManager…) whose ": base(...)" does not
+    /// match: the parameters of the ABP.io constructor (the widest one) come first, its own dependencies after them.
+    /// </summary>
+    private static void PlanBaseConstructor(SemanticModel model, ConstructorDeclarationSyntax ctor, Dictionary<SyntaxTree, Dictionary<SyntaxNode, SyntaxNode>> edits)
+    {
+        if (ctor.Parent is not ClassDeclarationSyntax cls || model.GetDeclaredSymbol(cls)?.BaseType is not { } baseType ||
+            !baseType.ContainingNamespace.ToDisplayString().StartsWith("Volo.", StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        var baseCtor = baseType.InstanceConstructors
+            .Where(c => c.DeclaredAccessibility is Accessibility.Public or Accessibility.Protected or Accessibility.ProtectedOrInternal)
+            .OrderByDescending(c => c.Parameters.Length).FirstOrDefault();
+        if (baseCtor is null) return;
+
+        var own = ctor.ParameterList.Parameters.Select(p => p.Identifier.Text).ToHashSet(StringComparer.Ordinal);
+        var indent = SyntaxHelpers.Indentation(ctor) + "    ";
+        var nl = ctor.SyntaxTree.GetText().ToString().Contains("\r\n", StringComparison.Ordinal) ? "\r\n" : "\n";
+        var baseParameters = baseCtor.Parameters
+            .Select(p => (Name: own.Contains(p.Name) ? p.Name + "Base" : p.Name, Type: p.Type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat)))
+            .ToList();
+        var parameters = baseParameters.Select(p => Parameter(Identifier(p.Name)).WithType(ParseTypeName(p.Type).WithTrailingTrivia(Space)))
+            .Concat(ctor.ParameterList.Parameters.Select(p => p.WithoutTrivia()))
+            .Select(p => p.WithLeadingTrivia(EndOfLine(nl), Whitespace(indent)))
+            .ToList();
+        var parameterList = ParameterList(SeparatedList(parameters, Enumerable.Repeat(Token(SyntaxKind.CommaToken), parameters.Count - 1)));
+        var arguments = ArgumentList(SeparatedList(baseParameters.Select(p => Argument(IdentifierName(p.Name))),
+            Enumerable.Repeat(Token(SyntaxKind.CommaToken).WithTrailingTrivia(Space), Math.Max(0, baseParameters.Count - 1))));
+        var initializer = ctor.Initializer!.WithArgumentList(arguments)
+            .WithColonToken(Token(SyntaxKind.ColonToken).WithLeadingTrivia(EndOfLine(nl), Whitespace(indent)).WithTrailingTrivia(Space));
+        Add(edits, ctor, ctor.WithParameterList(parameterList.WithTrailingTrivia(ctor.ParameterList.GetTrailingTrivia())).WithInitializer(initializer));
     }
 
     private static IEnumerable<ISymbol> Members(INamedTypeSymbol type)
@@ -230,22 +304,67 @@ public sealed partial class BuildFixStep
         }
 
         if (target is null || kind is null) return;
+
+        // (int?)x.RoleId: the cast stays, its operand is converted.
+        if (error.Code == "CS0030" && target is CastExpressionSyntax cast) target = cast.Expression;
+
+        // int ids: tenants or roles — the code tells (the argument's method, the assignment, the comparison…).
         if (kind == "tenant")
         {
             var context = (SyntaxNode?)target.AncestorsAndSelf().FirstOrDefault(n => n is StatementSyntax or AnonymousObjectMemberDeclaratorSyntax or
                 AssignmentExpressionSyntax or ArgumentSyntax or BinaryExpressionSyntax) ?? target;
             // An argument: the method it is passed to tells (CurrentTenant.Change(1), SetTenantId(id)…).
             var about = context is ArgumentSyntax { Parent.Parent: InvocationExpressionSyntax invocation } ? invocation.Expression + context.ToString() : context.ToString();
-            if (!about.Contains("tenant", StringComparison.OrdinalIgnoreCase)) return;
+            var own = target.ToString();
+            if (own.Contains("role", StringComparison.OrdinalIgnoreCase) && !own.Contains("tenant", StringComparison.OrdinalIgnoreCase)) kind = "role";
+            else if (own.Contains("tenant", StringComparison.OrdinalIgnoreCase) || about.Contains("tenant", StringComparison.OrdinalIgnoreCase)) kind = "tenant";
+            else if (about.Contains("role", StringComparison.OrdinalIgnoreCase)) kind = "role";
+            else return;
         }
 
         // Generated in Domain.Shared (a referenced project) by LegacyIdStep.
-        var (helperType, method) = kind == "tenant"
-            ? ("LegacyTenantIds", toGuid ? "ToTenantGuid" : "ToLegacyTenantId")
-            : ("LegacyUserIds", toGuid ? "ToUserGuid" : "ToLegacyUserId");
+        var (helperType, method) = kind switch
+        {
+            "tenant" => ("LegacyTenantIds", toGuid ? "ToTenantGuid" : "ToLegacyTenantId"),
+            "role" => ("LegacyRoleIds", toGuid ? "ToRoleGuid" : "ToLegacyRoleId"),
+            _ => ("LegacyUserIds", toGuid ? "ToUserGuid" : "ToLegacyUserId")
+        };
         if (FindType(semantic.Compilation, helperType) is not { } helper) return;
         Add(edits, target, ParseExpression($"global::{helper.ToDisplayString()}.{method}({target.WithoutTrivia()})").WithTriviaFrom(target));
     }
+
+    /// <summary>
+    /// ids.Contains(x.UserId) with source ids (long[] / List&lt;int&gt;… from a DTO) and an ABP.io Guid: the collection is converted
+    /// (ids.Select(__id => LegacyUserIds.ToUserGuid(__id)).ToArray()) — evaluated on the client, a parameter of the query.
+    /// </summary>
+    private static void PlanLegacyIdCollection(SemanticProject semantic, SyntaxNode node, BuildDiagnostic error,
+        Dictionary<SyntaxTree, Dictionary<SyntaxNode, SyntaxNode>> edits)
+    {
+        if (CollectionMessage().Match(error.Message) is not { Success: true } match || match.Groups["method"].Value != "Contains" ||
+            node.AncestorsAndSelf().OfType<InvocationExpressionSyntax>().FirstOrDefault(i => i.Expression is MemberAccessExpressionSyntax { Name.Identifier.Text: "Contains" })
+                is not { Expression: MemberAccessExpressionSyntax contains } invocation)
+        {
+            return;
+        }
+
+        var element = match.Groups["element"].Value.TrimEnd('?');
+        var argument = invocation.ArgumentList.Arguments.FirstOrDefault()?.Expression.ToString() ?? "";
+        var (helperType, method) = element switch
+        {
+            "long" => ("LegacyUserIds", "ToUserGuid"),
+            "int" when argument.Contains("Role", StringComparison.Ordinal) => ("LegacyRoleIds", "ToRoleGuid"),
+            "int" when argument.Contains("Tenant", StringComparison.Ordinal) => ("LegacyTenantIds", "ToTenantGuid"),
+            _ => ((string?)null, (string?)null)
+        };
+        if (helperType is null || FindType(semantic.Compilation, helperType) is not { } helper) return;
+
+        var receiver = contains.Expression.WithoutTrivia();
+        var converted = ParseExpression($"{Parenthesize(receiver)}.Select(__id => global::{helper.ToDisplayString()}.{method}(__id)).ToArray()");
+        Add(edits, contains.Expression, converted.WithTriviaFrom(contains.Expression));
+    }
+
+    [System.Text.RegularExpressions.GeneratedRegex(@"'(?:[\w.]+<)?(?<element>[\w.]+\??)(\[\]|>)' does not contain a definition for '(?<method>\w+)'")]
+    private static partial System.Text.RegularExpressions.Regex CollectionMessage();
 
     /// <summary>A type of the compilation (its own sources or a referenced project) by its simple name.</summary>
     private static INamedTypeSymbol? FindType(Compilation compilation, string name)
@@ -262,7 +381,7 @@ public sealed partial class BuildFixStep
             .FirstOrDefault(t => t.Name == name);
     }
 
-    [System.Text.RegularExpressions.GeneratedRegex(@"(?:Cannot implicitly convert type|cannot convert from) '(?<from>[^']+)' to '(?<to>[^']+)'")]
+    [System.Text.RegularExpressions.GeneratedRegex(@"(?:Cannot implicitly convert type|cannot convert from|Cannot convert type) '(?<from>[^']+)' to '(?<to>[^']+)'")]
     private static partial System.Text.RegularExpressions.Regex ConversionMessage();
 
     [System.Text.RegularExpressions.GeneratedRegex(@"Operator '(?<op>[^']+)' cannot be applied to operands of type '(?<a>[^']+)' and '(?<b>[^']+)'")]
@@ -360,7 +479,7 @@ public sealed partial class BuildFixStep
     }
 
     private int WriteEdits(MigrationContext context, Dictionary<SyntaxTree, Dictionary<SyntaxNode, SyntaxNode>> edits, Dictionary<string, int> totals, string kind,
-        Dictionary<BlockSyntax, List<string>>? declarations = null)
+        Dictionary<BlockSyntax, List<string>>? declarations = null, Dictionary<StatementSyntax, List<string>>? hoists = null)
     {
         var applied = 0;
         foreach (var (tree, replacements) in edits)
@@ -368,17 +487,38 @@ public sealed partial class BuildFixStep
             if (replacements.Count == 0 || !File.Exists(tree.FilePath) || context.IsExcluded(tree.FilePath)) continue;
             var (_, encoding) = FileSystem.ReadText(tree.FilePath);
 
-            // Local declarations the replacements use (e.g. "var __peopleQuery = ...") go at the start of their method body.
-            var blocks = declarations?.Where(d => d.Key.SyntaxTree == tree && d.Value.Count > 0).ToDictionary(d => d.Key, d => d.Value) ?? [];
-            var updated = tree.GetRoot().ReplaceNodes(replacements.Keys.Concat(blocks.Keys), (original, rewritten) =>
+            // Local declarations the replacements use go at the start of their method body ("var __peopleQuery = ...") or
+            // just before the statement that uses them (hoisted awaits): statement index in the block → statements to insert.
+            var blocks = new Dictionary<BlockSyntax, List<(int Index, string Statement)>>();
+            foreach (var (block, statements) in declarations?.Where(d => d.Key.SyntaxTree == tree) ?? [])
             {
-                if (original is BlockSyntax block && blocks.TryGetValue(block, out var statements))
+                if (!blocks.TryGetValue(block, out var list)) blocks[block] = list = [];
+                list.AddRange(statements.Select(s => (0, s)));
+            }
+
+            foreach (var (statement, statements) in hoists?.Where(h => h.Key.SyntaxTree == tree && h.Key.Parent is BlockSyntax) ?? [])
+            {
+                var block = (BlockSyntax)statement.Parent!;
+                if (!blocks.TryGetValue(block, out var list)) blocks[block] = list = [];
+                list.AddRange(statements.Select(s => (block.Statements.IndexOf(statement), s)));
+            }
+
+            var nl = tree.GetText().ToString().Contains("\r\n", StringComparison.Ordinal) ? "\r\n" : "\n";
+            var updated = tree.GetRoot().ReplaceNodes(replacements.Keys.Concat(blocks.Keys).Distinct(), (original, rewritten) =>
+            {
+                if (original is BlockSyntax block && blocks.TryGetValue(block, out var inserts))
                 {
                     var current = replacements.TryGetValue(original, out var replaced) ? (BlockSyntax)replaced : (BlockSyntax)rewritten;
-                    var indent = current.Statements.Count > 0 ? SyntaxHelpers.Indentation(current.Statements[0]) : SyntaxHelpers.Indentation(current) + "    ";
-                    var nl = tree.GetText().ToString().Contains("\r\n", StringComparison.Ordinal) ? "\r\n" : "\n";
-                    var added = statements.Select(s => ParseStatement(s).WithLeadingTrivia(Whitespace(indent)).WithTrailingTrivia(EndOfLine(nl)));
-                    return current.WithStatements(current.Statements.InsertRange(0, added));
+                    var result = current.Statements;
+                    foreach (var group in inserts.GroupBy(i => i.Index).OrderByDescending(g => g.Key))
+                    {
+                        var at = Math.Min(group.Key, result.Count);
+                        var indent = at < result.Count ? SyntaxHelpers.Indentation(result[at]) :
+                            result.Count > 0 ? SyntaxHelpers.Indentation(result[0]) : SyntaxHelpers.Indentation(current) + "    ";
+                        result = result.InsertRange(at, group.Select(i => ParseStatement(i.Statement).WithLeadingTrivia(Whitespace(indent)).WithTrailingTrivia(EndOfLine(nl))));
+                    }
+
+                    return current.WithStatements(result);
                 }
 
                 return replacements[original];

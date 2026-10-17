@@ -143,6 +143,36 @@ public sealed partial class BuildFixStep : IMigrationStep
             var root = tree.GetRoot();
             var text = tree.GetText();
 
+            // An override of a member ABP.io does not have (CS0115, e.g. a Module Zero manager kept as a subclass): nothing can
+            // call it any more, so the whole member goes under #if (stubbing its body would not remove the error).
+            var overrides = group.Where(e => e.Code == "CS0115" && e.Line >= 1 && e.Line <= text.Lines.Count)
+                .Select(e => (Error: e, Member: root.FindToken(text.Lines[e.Line - 1].Start + Math.Max(0, e.Column - 1)).Parent?.AncestorsAndSelf()
+                    .FirstOrDefault(n => n is MethodDeclarationSyntax or PropertyDeclarationSyntax or EventDeclarationSyntax)))
+                .Where(x => x.Member is not null)
+                .DistinctBy(x => x.Member!.SpanStart)
+                .ToList();
+            if (overrides.Count > 0)
+            {
+                var nl = code.Contains("\r\n", StringComparison.Ordinal) ? "\r\n" : "\n";
+                var excluded = code;
+                foreach (var (error, member) in overrides.OrderByDescending(x => x.Member!.SpanStart))
+                {
+                    var start = text.Lines.GetLineFromPosition(member!.SpanStart).Start;
+                    var end = member.FullSpan.End;
+                    var message = $"{error.Code}: {error.Message}".Replace(nl, " ");
+                    excluded = excluded[..start] +
+                               $"#if {OriginalCodeSymbol} // TODO [AbpToVolo]: overrides a member the ABP.io base class does not have ({message}). Port it or remove it.{nl}" +
+                               excluded[start..end].TrimEnd('\r', '\n') + nl + $"#endif{nl}" + excluded[end..];
+                    var location = $"{context.Relative(group.Key)}:{text.Lines.GetLinePosition(member.SpanStart).Line + 1}";
+                    stubbed.Add($"override excluded ({location}) — {message}");
+                    context.Report.Todo(Name, $"Override excluded from the build: the ABP.io base class has no such member ({message}).", location);
+                }
+
+                FileSystem.WriteText(group.Key, excluded, encoding);
+                count += overrides.Count;
+                continue;
+            }
+
             var bodies = new Dictionary<SyntaxNode, BuildDiagnostic>();
             BuildDiagnostic? declarationError = null;
             var declarationErrors = new List<BuildDiagnostic>();

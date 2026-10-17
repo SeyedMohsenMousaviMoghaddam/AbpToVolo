@@ -218,7 +218,7 @@ public static class ZeroMappings
             ["IsPhoneNumberConfirmed"] = "PhoneNumberConfirmed", ["IsLockoutEnabled"] = "LockoutEnabled",
             ["IsTwoFactorEnabled"] = "TwoFactorEnabled", ["Password"] = "PasswordHash", ["LockoutEndDateUtc"] = "LockoutEnd",
         },
-        [ZeroKind.Role] = new Dictionary<string, string>(StringComparer.Ordinal) { ["DisplayName"] = "Name" },
+        // Role: Name stays the unique name (permission grants use it); DisplayName is kept as an extension (MissingBaseProperties).
         // Tenant: Name stays the display name; TenancyName becomes an entity extension (see MissingBaseProperties).
     };
 
@@ -229,6 +229,9 @@ public static class ZeroMappings
             // Boilerplate tenants have TenancyName (identifier) and Name (display name): ABP.io has only Name. The display name
             // stays Name (the code reading tenant.Name keeps its meaning), TenancyName is kept as an extension.
             [ZeroKind.Tenant] = [("TenancyName", "string", null), ("IsActive", "bool", "true")],
+            // Boilerplate user members ABP.io IdentityUser does not have.
+            [ZeroKind.User] = [("PasswordResetCode", "string", null), ("EmailConfirmationCode", "string", null), ("AuthenticationSource", "string", null)],
+            [ZeroKind.Role] = [("DisplayName", "string", null)],
         };
 
     /// <summary>

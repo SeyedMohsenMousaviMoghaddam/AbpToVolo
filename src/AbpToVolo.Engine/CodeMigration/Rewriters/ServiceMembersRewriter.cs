@@ -88,6 +88,8 @@ public sealed class ServiceMembersRewriter : MigrationRewriter
                 "TenantId" => "CurrentTenant.Id",
                 "GetTenantId" => "CurrentTenant.GetId",
                 "ImpersonatorUserId" => "CurrentUser.FindImpersonatorUserId",
+                // UserIdentifier(tenantId, userId) → the user id: ABP.io identifies a user by its id alone.
+                "ToUserIdentifier" => "CurrentUser.GetId",
                 _ => null
             };
 
@@ -113,7 +115,7 @@ public sealed class ServiceMembersRewriter : MigrationRewriter
                     : visited.WithName(IdentifierName("GetRequiredLegacyId").WithTriviaFrom(visited.Name));
             }
 
-            var renamed = member switch { "UserId" => "Id", "GetUserId" => "GetId", _ => null };
+            var renamed = member switch { "UserId" => "Id", "GetUserId" => "GetId", "ToUserIdentifier" => "GetId", _ => null };
             if (renamed is not null)
             {
                 Context.Change($"{session.Identifier.Text}.{member} → {renamed}");
@@ -279,7 +281,9 @@ public sealed class ServiceMembersRewriter : MigrationRewriter
         // CurrentUnitOfWork.DisableFilter(AbpDataFilters.SoftDelete) → DataFilter.Disable<ISoftDelete>()
         if (method is "DisableFilter" or "EnableFilter" && receiver is "CurrentUnitOfWork" or "UnitOfWorkManager.Current" or "_unitOfWorkManager.Current")
         {
-            var filter = visited.ArgumentList.Arguments.Count == 1 ? visited.ArgumentList.Arguments[0].Expression.ToString() : "";
+            // Several filters that are one in ABP.io (MayHaveTenant + MustHaveTenant → IMultiTenant) become one Disable call.
+            var interfaces = visited.ArgumentList.Arguments.Select(a => DataFilters.GetValueOrDefault(a.Expression.ToString().Split('.').Last())).Distinct().ToList();
+            var filter = interfaces.Count == 1 && interfaces[0] is not null ? visited.ArgumentList.Arguments[0].Expression.ToString() : visited.ArgumentList.Arguments.Count == 1 ? visited.ArgumentList.Arguments[0].Expression.ToString() : "";
             var filterName = filter.Split('.').Last();
             if (DataFilters.TryGetValue(filterName, out var filterInterface))
             {

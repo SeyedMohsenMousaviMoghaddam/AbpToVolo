@@ -587,6 +587,18 @@ public sealed class ContractsStep : IMigrationStep
             constEdits.TryGetValue(node.Span, out var replacement)
                 ? ParseExpression(replacement).WithTriviaFrom(node)
                 : base.VisitMemberAccessExpression(node);
+
+        /// <summary>
+        /// "{ get; internal set; }": the type moves to another assembly (contracts), so the code that set the property
+        /// (the application layer) could no longer — the accessor becomes public.
+        /// </summary>
+        public override SyntaxNode? VisitAccessorDeclaration(AccessorDeclarationSyntax node)
+        {
+            var visited = (AccessorDeclarationSyntax)base.VisitAccessorDeclaration(node)!;
+            return visited.Modifiers.Count == 1 && visited.Modifiers[0].IsKind(SyntaxKind.InternalKeyword)
+                ? visited.WithModifiers(default).WithLeadingTrivia(visited.Modifiers[0].LeadingTrivia)
+                : visited;
+        }
     }
 
     private static CompilationUnitSyntax FilterUsings(CompilationUnitSyntax root, UsingFilter filter)

@@ -59,6 +59,12 @@ public sealed class ModuleZeroStep : IMigrationStep
 
         context.UsesIdentityModules = true;
         context.ProjectsUsingZero.UnionWith(context.Projects.Where(p => p.Layer is ProjectLayer.Domain or ProjectLayer.EntityFrameworkCore).Select(p => p.Name));
+
+        // Managers with members of their own (UserManager.GetPeopleIdFromUserId…) stay, as subclasses of the ABP.io manager:
+        // the code keeps calling them (see KeepManagerSubclasses).
+        var managers = zeroClasses.Where(z => z.Kind is ZeroKind.UserManager or ZeroKind.RoleManager && z.Replacement is not null && HasOwnMembers(z.Symbol)).ToList();
+        zeroClasses.RemoveAll(managers.Contains);
+
         var byType = new Dictionary<INamedTypeSymbol, ZeroClass>(SymbolEqualityComparer.Default);
         foreach (var z in zeroClasses) byType[z.Symbol] = z;
         foreach (var zero in zeroClasses.Where(z => ZeroMappings.IsEntity(z.Kind)))
@@ -98,7 +104,9 @@ public sealed class ModuleZeroStep : IMigrationStep
             foreach (var todo in rewriter.Todos.Distinct()) context.Report.Todo(Name, todo, context.Relative(file));
         }
 
+        foreach (var manager in managers) legacy.Remove(manager.File);
         MoveToLegacy(context, legacy);
+        KeepManagerSubclasses(context, managers);
         RepairProtectedFiles(context, model, legacy, zeroClasses);
         RemoveNotificationUsages(context, model, legacy);
         ResolveIdentityAmbiguity(context);
@@ -162,6 +170,61 @@ public sealed class ModuleZeroStep : IMigrationStep
             zero.Properties.Add(new ExtensionProperty(name, type, null, false, defaultValue));
         }
     }
+
+    /// <summary>Public members the manager adds to the Module Zero one (not constructors, not overrides).</summary>
+    private static bool HasOwnMembers(INamedTypeSymbol type) =>
+        type.GetMembers().Any(m => m.DeclaredAccessibility is Accessibility.Public or Accessibility.Internal && !m.IsOverride && !m.IsImplicitlyDeclared &&
+                                   m is IMethodSymbol { MethodKind: MethodKind.Ordinary } or IPropertySymbol);
+
+    /// <summary>
+    /// A Zero manager with members of its own (UserManager.GetPeopleIdFromUserId…) becomes a subclass of the ABP.io manager
+    /// that replaces it in dependency injection, so the code keeps calling its members and the ABP.io modules use it too:
+    ///   class UserManager : AbpUserManager&lt;Role, User&gt;  →  [ExposeServices(IdentityUserManager…)] class UserManager : IdentityUserManager
+    /// Its constructor keeps its own dependencies; the base parameters come from the ABP.io constructor (compiler-guided
+    /// fixes, which know it). Overrides of Module Zero members are left to the compiler (removed when ABP.io has no such member).
+    /// </summary>
+    private void KeepManagerSubclasses(MigrationContext context, List<ZeroClass> managers)
+    {
+        foreach (var manager in managers)
+        {
+            if (!File.Exists(manager.File)) continue;
+            var (code, encoding) = FileSystem.ReadText(manager.File);
+            var root = CSharpSyntaxTree.ParseText(code).GetCompilationUnitRoot();
+            if (root.DescendantNodes().OfType<ClassDeclarationSyntax>().FirstOrDefault(c => c.Identifier.Text == manager.Symbol.Name) is not { BaseList: { } baseList } cls) continue;
+            var replacement = manager.Replacement!;
+            var nl = code.Contains("\r\n", StringComparison.Ordinal) ? "\r\n" : "\n";
+            var indent = SyntaxHelpers.Indentation(cls);
+
+            // Base type → the ABP.io manager.
+            var newBase = baseList.WithTypes(baseList.Types.Replace(baseList.Types[0], SimpleBaseType(IdentifierName(replacement.Name)).WithTriviaFrom(baseList.Types[0])));
+
+            // Constructors: only the manager's own dependencies; ": base()" is completed by the compiler-guided fixes.
+            var members = cls.Members.Select(member =>
+            {
+                if (member is not ConstructorDeclarationSyntax ctor) return member;
+                var passed = ctor.Initializer?.ArgumentList.Arguments.Select(a => a.Expression.ToString()).ToHashSet(StringComparer.Ordinal) ?? [];
+                var own = ctor.ParameterList.Parameters.Where(p => !passed.Contains(p.Identifier.Text));
+                return ctor.WithParameterList(ctor.ParameterList.WithParameters(SeparatedList(own)))
+                    .WithInitializer(ConstructorInitializer(SyntaxKind.BaseConstructorInitializer, ArgumentList())
+                        .WithColonToken(Token(SyntaxKind.ColonToken).WithLeadingTrivia(Space).WithTrailingTrivia(Space)))
+                    .WithLeadingTrivia(ctor.GetLeadingTrivia().Add(Comment($"// AbpToVolo: {replacement.Name} subclass — its base parameters are added by the compiler-guided fixes."))
+                        .Add(EndOfLine(nl)).Add(Whitespace(SyntaxHelpers.Indentation(ctor))));
+            }).ToList();
+
+            var attribute = AttributeListOf(
+                    $"[global::Volo.Abp.DependencyInjection.Dependency(ReplaceServices = true), global::Volo.Abp.DependencyInjection.ExposeServices(typeof({replacement.Name}), typeof({cls.Identifier.Text}))]")
+                .WithLeadingTrivia(cls.GetLeadingTrivia()).WithTrailingTrivia(EndOfLine(nl), Whitespace(indent));
+            var updated = cls.WithBaseList(newBase).WithMembers(List(members))
+                .WithoutLeadingTrivia().WithAttributeLists(cls.AttributeLists.Insert(0, attribute));
+            var result = ModuleMethodEditor.AddUsings(root.ReplaceNode(cls, updated).ToFullString(), [replacement.Namespace]);
+            FileSystem.WriteText(manager.File, result, encoding);
+            context.Report.Change(Name, $"{cls.Identifier.Text} kept as a subclass of {replacement.Name} (it has members of its own); it replaces {replacement.Name} in dependency injection",
+                context.Relative(manager.File));
+        }
+    }
+
+    private static AttributeListSyntax AttributeListOf(string text) =>
+        ((ClassDeclarationSyntax)SyntaxFactory.ParseMemberDeclaration($"{text} class X {{ }}")!).AttributeLists[0];
 
     /// <summary>
     /// Navigations of the Zero entity to the solution's entities ("public People People" with [ForeignKey("PeopleId")] or a
@@ -736,7 +799,7 @@ public sealed class ModuleZeroStep : IMigrationStep
         public override SyntaxNode? VisitIdentifierName(IdentifierNameSyntax node)
         {
             var symbol = model.GetSymbolInfo(node).Symbol;
-            if (ZeroOf(symbol) is { Replacement: { } replacement } z && !IsMemberName(node))
+            if (ZeroOf(symbol) is { Replacement: { } replacement } z && !IsMemberName(node) && !IsInheritedPropertyOfSameName(node, z))
             {
                 return Replace(node, replacement, $"{z.Symbol.Name} → {replacement.Name}");
             }
@@ -929,6 +992,14 @@ public sealed class ModuleZeroStep : IMigrationStep
 
             return base.VisitObjectCreationExpression(node);
         }
+
+        /// <summary>
+        /// "PermissionChecker.IsGranted(...)" inside a Boilerplate service: PermissionChecker is the property of the base class
+        /// (unknown here), which binds to the solution's PermissionChecker class because of the same name — not a static access.
+        /// </summary>
+        private static bool IsInheritedPropertyOfSameName(IdentifierNameSyntax node, ZeroClass zero) =>
+            !ZeroMappings.IsEntity(zero.Kind) && node.Parent is MemberAccessExpressionSyntax access && access.Expression == node &&
+            !zero.Symbol.GetMembers(access.Name.Identifier.Text).Any(m => m.IsStatic);
 
         private static bool IsMemberName(IdentifierNameSyntax node) =>
             node.Parent is MemberAccessExpressionSyntax ma && ma.Name == node ||

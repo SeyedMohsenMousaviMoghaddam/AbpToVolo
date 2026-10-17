@@ -118,6 +118,36 @@ public static partial class EndpointParity
         return new Result(source.Count, missing, verbChanged);
     }
 
+    /// <summary>
+    /// Endpoints of the source whose converted action still throws the "did not compile" NotImplementedException of the
+    /// compiler-guided fixes (the route exists, the implementation does not): "Class.Method" → file of the converted class.
+    /// </summary>
+    public static List<string> StubbedEndpoints(List<Endpoint> source, string convertedRoot)
+    {
+        var wanted = source.Select(e => e.Source.Split(": ").Last()).ToHashSet(StringComparer.Ordinal);
+        var classes = wanted.Select(w => w.Split('.')[0]).ToHashSet(StringComparer.Ordinal);
+        var stubbed = new List<string>();
+        foreach (var file in Directory.EnumerateFiles(convertedRoot, "*.cs", SearchOption.AllDirectories))
+        {
+            if (file.Contains(Path.DirectorySeparatorChar + "obj" + Path.DirectorySeparatorChar, StringComparison.Ordinal)) continue;
+            var text = File.ReadAllText(file);
+            if (!text.Contains("did not compile after the conversion", StringComparison.Ordinal) || !classes.Any(c => text.Contains("class " + c, StringComparison.Ordinal))) continue;
+
+            var root = CSharpSyntaxTree.ParseText(text).GetRoot();
+            foreach (var method in root.DescendantNodes().OfType<MethodDeclarationSyntax>())
+            {
+                var owner = method.Ancestors().OfType<ClassDeclarationSyntax>().FirstOrDefault()?.Identifier.Text;
+                if (owner is null || !wanted.Contains($"{owner}.{method.Identifier.Text}")) continue;
+                if (method.Body?.ToFullString().Contains("NotImplementedException(\"AbpToVolo:", StringComparison.Ordinal) == true)
+                {
+                    stubbed.Add($"{owner}.{method.Identifier.Text}");
+                }
+            }
+        }
+
+        return stubbed.Distinct().OrderBy(s => s, StringComparer.Ordinal).ToList();
+    }
+
     /// <summary>Lower case, route parameters as {} (names and constraints do not matter for the client).</summary>
     private static string Normalize(string path) => RouteParameter().Replace(path.Trim().TrimEnd('/'), "{}").ToLowerInvariant();
 

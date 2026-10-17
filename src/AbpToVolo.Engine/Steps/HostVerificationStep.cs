@@ -78,9 +78,11 @@ public sealed partial class HostVerificationStep : IMigrationStep
     private void CheckEndpoints(MigrationContext context, string swagger)
     {
         EndpointParity.Result parity;
+        List<EndpointParity.Endpoint> source;
         try
         {
-            parity = EndpointParity.Compare(EndpointParity.SourceEndpoints(context.Options.InputPath), EndpointParity.SwaggerEndpoints(swagger));
+            source = EndpointParity.SourceEndpoints(context.Options.InputPath);
+            parity = EndpointParity.Compare(source, EndpointParity.SwaggerEndpoints(swagger));
         }
         catch (System.Text.Json.JsonException e)
         {
@@ -106,6 +108,18 @@ public sealed partial class HostVerificationStep : IMigrationStep
         if (parity.Missing.Count == 0 && parity.VerbChanged.Count == 0)
         {
             context.Report.Change(Name, $"All {parity.Expected} endpoints of the source answer at the same path and verb");
+        }
+
+        // Present but not implemented: the action still throws the NotImplementedException of the compiler-guided fixes.
+        var stubbed = EndpointParity.StubbedEndpoints(source, context.OutputRoot);
+        lines.Add(stubbed.Count == 0
+            ? "Every endpoint of the source is implemented (no action throws the AbpToVolo NotImplementedException)."
+            : $"{stubbed.Count} endpoints answer but are **not implemented yet** (their action did not compile and throws NotImplementedException):");
+        lines.AddRange(stubbed.Select(s => $"- `{s}`"));
+        context.Log.WriteLine($"    Endpoints not implemented (stubbed action): {stubbed.Count}");
+        foreach (var endpoint in stubbed)
+        {
+            context.Report.Todo(Name, $"Endpoint not implemented (its action throws NotImplementedException): {endpoint}");
         }
     }
 

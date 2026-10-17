@@ -57,6 +57,31 @@ public sealed class EndpointParityTests : IDisposable
     }
 
     [Fact]
+    public void Endpoints_whose_action_is_stubbed_are_listed()
+    {
+        var converted = Path.Combine(_source, "converted");
+        Directory.CreateDirectory(converted);
+        File.WriteAllText(Path.Combine(converted, "CustomerAppService.cs"), """
+            public class CustomerAppService
+            {
+                public async Task<int> GetCustomerAsync(long id)
+                {
+            #if ABPTOVOLO_ORIGINAL // TODO [AbpToVolo]: did not compile after the conversion (CS0103: x).
+                    return 1;
+            #endif
+                    throw new System.NotImplementedException("AbpToVolo: CustomerAppService.GetCustomerAsync did not compile after the conversion; see #if ABPTOVOLO_ORIGINAL.");
+                }
+
+                public Task DeleteCustomer(long id) => Task.CompletedTask;
+            }
+            """);
+
+        var stubbed = EndpointParity.StubbedEndpoints(EndpointParity.SourceEndpoints(Path.Combine(_source, "src")), converted);
+
+        Assert.Equal("CustomerAppService.GetCustomerAsync", Assert.Single(stubbed));
+    }
+
+    [Fact]
     public void Missing_endpoints_and_changed_verbs_are_found()
     {
         const string swagger = """
