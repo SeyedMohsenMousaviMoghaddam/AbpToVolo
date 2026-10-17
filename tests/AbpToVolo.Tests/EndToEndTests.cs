@@ -279,6 +279,8 @@ public sealed class EndToEndTests : IDisposable
         var login = Read($"src/Acme.PhoneBook.Domain/{CompatShimStep.ShimFolder}/LogInManagerCompat.cs");
         Assert.Contains("public virtual async Task<AbpLoginResult<Tenant, IdentityUser>> LoginAsync(", login);
         Assert.Contains("public class AbpLoginResultTypeHelper", login);
+        // ClaimTypes.NameIdentifier (read by CreateJwtClaims) on every principal, also SignInManager.CreateUserPrincipalAsync.
+        Assert.Contains("public class BoilerplateClaimsPrincipalContributor : IAbpClaimsPrincipalContributor, ITransientDependency", login);
 
         // --id-type source: source ids ↔ ABP.io ids where DTOs and entities meet.
         var maps = Read($"src/Acme.PhoneBook.Domain.Shared/{CompatShimStep.ShimFolder}/LegacyIdMaps.cs");
