@@ -18,6 +18,8 @@ namespace AbpToVolo.Steps;
 public sealed partial class BuildFixStep
 {
     private const string TenantType = "Volo.Abp.TenantManagement.Tenant";
+    private const string IdentityUserType = "Volo.Abp.Identity.IdentityUser";
+    private const string IdentityRoleType = "Volo.Abp.Identity.IdentityRole";
     private const string LegacyIdProperty = "LegacyId";
 
     private static readonly HashSet<string> TypeMismatchCodes = new(StringComparer.Ordinal) { "CS0029", "CS0266", "CS0019", "CS1503", "CS0030", "CS0173", "CS1662", "CS1929" };
@@ -36,7 +38,7 @@ public sealed partial class BuildFixStep
         if (!context.UsesIdentityModules) return 0;
         var legacyIds = context.Options.IdType == IdTypeMode.Source;
         var applied = 0;
-        var relevant = errors.Where(e => legacyIds && TypeMismatchCodes.Contains(e.Code) ||
+        var relevant = errors.Where(e => legacyIds && (TypeMismatchCodes.Contains(e.Code) || e.Code == "CS1941") ||
                                          e.Code == "CS1061" && MissingMember().Match(e.Message) is { Success: true } m &&
                                          IsZeroMember(context, m.Groups["type"].Value, m.Groups["member"].Value) ||
                                          e.Code is "CS7036" or "CS1729" or "CS1995");
@@ -81,6 +83,12 @@ public sealed partial class BuildFixStep
                 if (error.Code == "CS1929")
                 {
                     PlanLegacyIdCollection(semantic, node, error, edits);
+                    continue;
+                }
+
+                if (error.Code == "CS1941")
+                {
+                    PlanLegacyIdJoin(model, node, edits);
                     continue;
                 }
 
@@ -330,8 +338,56 @@ public sealed partial class BuildFixStep
             _ => ("LegacyUserIds", toGuid ? "ToUserGuid" : "ToLegacyUserId")
         };
         if (FindType(semantic.Compilation, helperType) is not { } helper) return;
+
+        // guids.Contains(x.RoleId) in an EF Core query: LegacyRoleIds.ToRoleGuid(x.RoleId) cannot be translated, so the in-memory
+        // collection is converted instead (guids.Select(__id => LegacyRoleIds.ToLegacyRoleId(__id)).ToArray(), a query parameter).
+        if (toGuid && target.Parent is ArgumentSyntax { Parent: ArgumentListSyntax { Arguments.Count: 1, Parent: InvocationExpressionSyntax
+            {
+                Expression: MemberAccessExpressionSyntax { Name.Identifier.Text: "Contains" } contains
+            } } } &&
+            !IsQueryable(model.GetTypeInfo(contains.Expression).Type) && InExpressionTree(model, target))
+        {
+            var reverse = kind switch { "tenant" => "ToLegacyTenantId", "role" => "ToLegacyRoleId", _ => "ToLegacyUserId" };
+            Add(edits, contains.Expression, ParseExpression(
+                    $"{Parenthesize(contains.Expression.WithoutTrivia())}.Select(__id => global::{helper.ToDisplayString()}.{reverse}(__id)).ToArray()")
+                .WithTriviaFrom(contains.Expression));
+            return;
+        }
+
         Add(edits, target, ParseExpression($"global::{helper.ToDisplayString()}.{method}({target.WithoutTrivia()})").WithTriviaFrom(target));
     }
+
+    /// <summary>
+    /// CS1941 — join … on x.RoleId equals r.Id: a source id (long/int) against the Guid key of an ABP.io user/role/tenant
+    /// → join … on x.RoleId equals EF.Property&lt;int&gt;(r, "LegacyId").
+    /// </summary>
+    internal static void PlanLegacyIdJoin(SemanticModel model, SyntaxNode node, Dictionary<SyntaxTree, Dictionary<SyntaxNode, SyntaxNode>> edits)
+    {
+        if (node.AncestorsAndSelf().OfType<JoinClauseSyntax>().FirstOrDefault() is not { } join) return;
+        if (ElementType(model.GetTypeInfo(join.InExpression).Type) is not { } element ||
+            element.ToDisplayString() is not (IdentityUserType or IdentityRoleType or TenantType))
+        {
+            return;
+        }
+
+        var variable = join.Identifier.Text;
+        foreach (var (key, other) in new[] { (join.RightExpression, join.LeftExpression), (join.LeftExpression, join.RightExpression) })
+        {
+            if (key is not MemberAccessExpressionSyntax { Name.Identifier.Text: "Id", Expression: IdentifierNameSyntax owner } || owner.Identifier.Text != variable) continue;
+            if (model.GetTypeInfo(other).Type is not { } otherType) return;
+            var type = otherType.ToDisplayString();
+            if (type is not ("long" or "int" or "long?" or "int?")) return;
+            Add(edits, key, ParseExpression($"EF.Property<{type}>({variable}, \"{LegacyIdProperty}\")").WithTriviaFrom(key));
+            return;
+        }
+    }
+
+    private static ITypeSymbol? ElementType(ITypeSymbol? type) => type switch
+    {
+        INamedTypeSymbol { IsGenericType: true, TypeArguments: [var element] } named when named.Name is "IQueryable" or "IEnumerable" or "List" or "DbSet" => element,
+        INamedTypeSymbol named => named.AllInterfaces.FirstOrDefault(i => i.Name == "IQueryable" && i.IsGenericType)?.TypeArguments[0],
+        _ => null
+    };
 
     /// <summary>
     /// ids.Contains(x.UserId) with source ids (long[] / List&lt;int&gt;… from a DTO) and an ABP.io Guid: the collection is converted

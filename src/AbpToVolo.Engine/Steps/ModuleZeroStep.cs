@@ -839,7 +839,7 @@ public sealed class ModuleZeroStep : IMigrationStep
 
             // IRepository<UserClaim, long> → IRepository<IdentityUserClaim, Guid> (ABP.io Identity entities have Guid keys).
             if (args.Count == 2 && args[0] is IdentifierNameSyntax guidEntity && model.GetSymbolInfo(guidEntity).Symbol is null &&
-                guidEntity.Identifier.Text is "UserClaim" or "RoleClaim" or "OrganizationUnit" or "RolePermissionSetting" or "UserPermissionSetting" or "PermissionSetting" &&
+                guidEntity.Identifier.Text is "UserClaim" or "RoleClaim" or "OrganizationUnit" &&
                 args[1] is PredefinedTypeSyntax { Keyword.Text: "long" or "int" })
             {
                 Changed = true;

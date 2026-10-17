@@ -109,9 +109,8 @@ public static class ZeroMappings
         ["OrganizationUnit"] = new("OrganizationUnit", "Volo.Abp.Identity"),
         ["UserOrganizationUnit"] = new("IdentityUserOrganizationUnit", "Volo.Abp.Identity"),
         ["OrganizationUnitRole"] = new("OrganizationUnitRole", "Volo.Abp.Identity"),
-        ["RolePermissionSetting"] = new("PermissionGrant", "Volo.Abp.PermissionManagement"),
-        ["UserPermissionSetting"] = new("PermissionGrant", "Volo.Abp.PermissionManagement"),
-        ["PermissionSetting"] = new("PermissionGrant", "Volo.Abp.PermissionManagement"),
+        // RolePermissionSetting, UserPermissionSetting, PermissionSetting keep their names: read-only entities of the same
+        // shape over AbpPermissionGrants (ZeroColumnsStep).
         ["UserIdentifier"] = new("Guid", "System"),
     };
 

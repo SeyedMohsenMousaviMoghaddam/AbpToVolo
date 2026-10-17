@@ -27,12 +27,12 @@ public sealed partial class BuildFixStep : IMigrationStep
     /// <summary>With --stub-unresolved every stubbing round lets the build reach further projects, so more rounds are needed.</summary>
     public const int MaxIterationsWithStubs = 40;
 
-    private delegate SyntaxNode Fix(SyntaxNode node);
+    internal delegate SyntaxNode Fix(SyntaxNode node);
 
     /// <summary>A fix that returns its node with this annotation removes the node (e.g. a using directive).</summary>
     private static readonly SyntaxAnnotation Remove = new("AbpToVolo.Remove");
 
-    private sealed record PlannedFix(SyntaxNode Target, Fix Apply, string Kind, string[] Usings);
+    internal sealed record PlannedFix(SyntaxNode Target, Fix Apply, string Kind, string[] Usings);
 
     public string Name => "Compiler-guided fixes";
 
@@ -539,6 +539,12 @@ public sealed partial class BuildFixStep : IMigrationStep
         var token = root.FindToken(position);
         return error.Code switch
         {
+            // PermissionManager.GetAllPermissions(): Boilerplate's base-class IPermissionManager; in ABP.io the name is the
+            // PermissionManager class of Volo.Abp.PermissionManagement.
+            "CS0117" when error.Message.StartsWith("'PermissionManager' does not contain", StringComparison.Ordinal) &&
+                          CompatShimStep.EnsurePermissionManagerShim(context) is { } shimNs => PlanAmbientMembers(token, shimNs),
+            "CS0103" when error.Message.Contains("'PermissionManager'", StringComparison.Ordinal) &&
+                          CompatShimStep.EnsurePermissionManagerShim(context) is { } shimNs => PlanAmbientMembers(token, shimNs),
             "CS1061" or "CS0117" when MissingMember().Match(error.Message) is { Success: true } m =>
                 PlanMissingMember(context, token, Simple(m.Groups["type"].Value), m.Groups["member"].Value),
             "CS1929" when LocalizedStringMember().Match(error.Message) is { Success: true } m => PlanLocalizedString(token, m.Groups["member"].Value),
@@ -614,9 +620,13 @@ public sealed partial class BuildFixStep : IMigrationStep
         ["LocalizationManager"] = ("Microsoft.Extensions.Localization", "public IStringLocalizerFactory LocalizationManager { get; set; }"),
         // Boilerplate repositories had MultiTenancySide; ABP.io repositories have CurrentTenant
         ["MultiTenancySide"] = ("Volo.Abp.MultiTenancy", "protected MultiTenancySides MultiTenancySide => CurrentTenant.IsAvailable ? MultiTenancySides.Tenant : MultiTenancySides.Host;"),
+        // Boilerplate's IPermissionManager (GetAllPermissions...) → generated BoilerplatePermissionManager (namespace of the shims).
+        ["PermissionManager"] = (ShimNamespace, "public BoilerplatePermissionManager PermissionManager { get; set; }"),
     };
 
-    private static PlannedFix? PlanAmbientMembers(SyntaxToken token)
+    private const string ShimNamespace = "{shims}";
+
+    private static PlannedFix? PlanAmbientMembers(SyntaxToken token, string? shimNamespace = null)
     {
         var cls = token.Parent?.AncestorsAndSelf().OfType<ClassDeclarationSyntax>().FirstOrDefault();
         if (cls is null || cls.Modifiers.Any(SyntaxKind.StaticKeyword)) return null;
@@ -631,7 +641,7 @@ public sealed partial class BuildFixStep : IMigrationStep
 
         // Every ambient name used as a simple identifier (not as a member name x.CurrentUser) and not declared in the class.
         var needed = cls.DescendantNodes().OfType<IdentifierNameSyntax>()
-            .Where(n => AmbientMembers.ContainsKey(n.Identifier.Text) &&
+            .Where(n => AmbientMembers.TryGetValue(n.Identifier.Text, out var ambient) && (ambient.Namespace != ShimNamespace || shimNamespace is not null) &&
                         !(n.Parent is MemberAccessExpressionSyntax ma && ma.Name == n) && n.Parent is not QualifiedNameSyntax)
             .Select(n => n.Identifier.Text)
             .Where(n => !declared.Contains(n))
@@ -652,7 +662,7 @@ public sealed partial class BuildFixStep : IMigrationStep
             });
             return c.WithMembers(List(members.Concat(c.Members)));
         }, $"declared property-injected {string.Join("/", names)} (former Boilerplate base-class members)",
-            names.Select(name => AmbientMembers[name].Namespace).Distinct().ToArray());
+            names.Select(name => AmbientMembers[name].Namespace == ShimNamespace ? shimNamespace! : AmbientMembers[name].Namespace).Distinct().ToArray());
     }
 
     /// <summary>
@@ -1082,6 +1092,36 @@ public sealed partial class BuildFixStep : IMigrationStep
         ["ShouldChangePasswordOnNextLogin"] = "{0}.SetShouldChangePasswordOnNextLogin({1});",
     };
 
+    /// <summary>
+    /// new User { Id = id } — Boilerplate code passes a user by its id (userManager.GetRolesAsync(user)...); ABP.io's
+    /// IdentityUser has no public parameterless constructor, the user is loaded:
+    ///   → (await LazyServiceProvider.LazyGetRequiredService&lt;IdentityUserManager&gt;().GetByIdAsync(id))
+    /// The id of the current user (CurrentUser.GetLegacyId().Value) becomes CurrentUser.GetId(); another source id is
+    /// converted by the id fixes of the next round.
+    /// </summary>
+    internal static PlannedFix? UserById(ObjectCreationExpressionSyntax creation)
+    {
+        if (SyntaxHelpers.SimpleName(creation.Type) != "IdentityUser" || creation.ArgumentList is { Arguments.Count: > 0 } ||
+            creation.Initializer?.Expressions is not [AssignmentExpressionSyntax { Left: IdentifierNameSyntax { Identifier.Text: "Id" }, Right: var id }])
+        {
+            return null;
+        }
+
+        var method = creation.Ancestors().FirstOrDefault(a => a is BaseMethodDeclarationSyntax or LocalFunctionStatementSyntax or AnonymousFunctionExpressionSyntax);
+        var isAsync = method switch
+        {
+            BaseMethodDeclarationSyntax m => m.Modifiers.Any(SyntaxKind.AsyncKeyword),
+            LocalFunctionStatementSyntax f => f.Modifiers.Any(SyntaxKind.AsyncKeyword),
+            AnonymousFunctionExpressionSyntax f => f.AsyncKeyword.IsKind(SyntaxKind.AsyncKeyword),
+            _ => false
+        };
+        var key = id.WithoutTrivia().ToString() is "CurrentUser.GetLegacyId().Value" or "CurrentUser.GetLegacyId()!.Value" ? "CurrentUser.GetId()" : id.WithoutTrivia().ToString();
+        var load = $"LazyServiceProvider.LazyGetRequiredService<IdentityUserManager>().GetByIdAsync({key})";
+        return new PlannedFix(creation,
+            n => ParseExpression(isAsync ? $"(await {load})" : $"global::Volo.Abp.Threading.AsyncHelper.RunSync(() => {load})").WithTriviaFrom(n),
+            "new IdentityUser { Id = … } (a user passed by its id) → IdentityUserManager.GetByIdAsync", ["Volo.Abp.Identity", "Volo.Abp.Users"]);
+    }
+
     private static PlannedFix? PlanSetter(MigrationContext context, SyntaxToken token, string type, string member)
     {
         // Object initializer: new Person { Id = id, Name = n } → new Person { Name = n }.SetProtected(e => e.Id, id)
@@ -1089,6 +1129,7 @@ public sealed partial class BuildFixStep : IMigrationStep
             init.Left == name && name.Identifier.Text == member &&
             (member == "Id" || member is "CreatorId" or "LastModifierId" or "CreationTime" or "LastModificationTime"))
         {
+            if (member == "Id" && UserById(creation) is { } userById) return userById;
             if (CompatShimStep.EnsureProtectedSetterShim(context) is not { } ns) return null;
             return new PlannedFix(creation, n =>
             {

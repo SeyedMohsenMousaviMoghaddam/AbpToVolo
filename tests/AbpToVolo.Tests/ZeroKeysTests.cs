@@ -241,6 +241,20 @@ public sealed class ZeroKeysTests : RewriterTestBase
     }
 
     [Fact]
+    public void Settings_and_role_grants_are_copied_per_tenant()
+    {
+        var sql = ZeroDatabase.DataMigrationSql(new Dictionary<string, string> { ["AbpSettings"] = "Zero_AbpSettings" }, []);
+
+        // Settings: user → "U", tenant → "T", application → "G", with the new ids (lower case, as ABP.io writes them).
+        Assert.Contains("INSERT INTO dbo.[AbpSettings] (Id, Name, Value, ProviderName, ProviderKey)", sql);
+        Assert.Contains("FROM dbo.[Zero_AbpSettings] s", sql);
+        Assert.Contains("CASE WHEN s.UserId IS NOT NULL THEN N'U' WHEN s.TenantId IS NOT NULL THEN N'T' ELSE N'G' END AS ProviderName", sql);
+        Assert.Contains("WHERE d.RowNumber = 1", sql); // Zero can hold duplicates; ABP.io has a unique index
+        // Roles of the same name in different tenants (admin) each get their grants.
+        Assert.Contains("AND (x.TenantId = tm.NewId OR (x.TenantId IS NULL AND tm.NewId IS NULL))", sql);
+    }
+
+    [Fact]
     public void Renamed_members_keep_their_name_in_anonymous_types()
     {
         var declarator = (Microsoft.CodeAnalysis.CSharp.Syntax.AnonymousObjectMemberDeclaratorSyntax)
@@ -278,5 +292,73 @@ public sealed class ZeroKeysTests : RewriterTestBase
             .Single(a => a.Name.Identifier.Text == "ExpireDate");
 
         Assert.Equal(expected, BuildFixStep.InExpressionTree(model, access));
+    }
+
+    [Theory]
+    [InlineData("async Task M() { var user = new IdentityUser { Id = CurrentUser.GetLegacyId().Value }; }",
+        "(await LazyServiceProvider.LazyGetRequiredService<IdentityUserManager>().GetByIdAsync(CurrentUser.GetId()))")]
+    [InlineData("void M(long id) { var user = new IdentityUser { Id = id }; }",
+        "global::Volo.Abp.Threading.AsyncHelper.RunSync(() => LazyServiceProvider.LazyGetRequiredService<IdentityUserManager>().GetByIdAsync(id))")]
+    [InlineData("void M(long id) { var user = new IdentityUser { Id = id, Name = \"x\" }; }", null)] // a new user, not a user passed by id
+    public void User_passed_by_its_id_is_loaded(string method, string? expected)
+    {
+        var creation = CSharpSyntaxTree.ParseText($"class C {{ {method} }}").GetRoot().DescendantNodes()
+            .OfType<Microsoft.CodeAnalysis.CSharp.Syntax.ObjectCreationExpressionSyntax>().Single();
+
+        var fix = BuildFixStep.UserById(creation);
+
+        Assert.Equal(expected, fix?.Apply(creation).ToString());
+    }
+
+    [Theory]
+    [InlineData("join r in roles on rp.RoleId equals r.Id", "r.Id", "EF.Property<int>(r, \"LegacyId\")")]
+    [InlineData("join r in roles on rp.OwnerKey equals r.Id", null, null)] // Guid against Guid: nothing to do
+    public void Source_id_joined_with_an_abp_key_uses_the_legacy_id(string join, string? replaced, string? expected)
+    {
+        var source = $$"""
+            using System; using System.Linq;
+            namespace Volo.Abp.Identity { public class IdentityRole { public Guid Id { get; set; } } }
+            class Grant { public int RoleId { get; set; } public Guid OwnerKey { get; set; } }
+            class C
+            {
+                object M(IQueryable<Grant> grants, IQueryable<Volo.Abp.Identity.IdentityRole> roles) =>
+                    from rp in grants
+                    {{join}}
+                    select rp;
+            }
+            """;
+        var tree = CSharpSyntaxTree.ParseText(source);
+        var references = ((string)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES")!).Split(Path.PathSeparator)
+            .Select(p => Microsoft.CodeAnalysis.MetadataReference.CreateFromFile(p));
+        var model = CSharpCompilation.Create("T", [tree], references).GetSemanticModel(tree);
+        var clause = tree.GetRoot().DescendantNodes().OfType<Microsoft.CodeAnalysis.CSharp.Syntax.JoinClauseSyntax>().Single();
+        var edits = new Dictionary<Microsoft.CodeAnalysis.SyntaxTree, Dictionary<Microsoft.CodeAnalysis.SyntaxNode, Microsoft.CodeAnalysis.SyntaxNode>>();
+
+        BuildFixStep.PlanLegacyIdJoin(model, clause.JoinKeyword.Parent!, edits);
+
+        var edit = edits.Values.SelectMany(e => e).SingleOrDefault();
+        Assert.Equal(replaced, edit.Key?.ToString());
+        Assert.Equal(expected, edit.Value?.ToString());
+    }
+
+    [Theory]
+    [InlineData(true, "long UserId", "int RoleId", "u.LegacyId AS UserId")]
+    [InlineData(false, "Guid UserId", "Guid RoleId", "u.Id AS UserId")]
+    public void Permission_settings_are_read_only_entities_over_permission_grants(bool legacyIds, string userId, string roleId, string userColumn)
+    {
+        var entities = ZeroColumnsStep.PermissionSettingsCode("Acme", legacyIds);
+        var efCore = ZeroColumnsStep.PermissionSettingsEfCoreCode("Acme", "Acme.EntityFrameworkCore", legacyIds);
+
+        Assert.Empty(CSharpSyntaxTree.ParseText(entities).GetDiagnostics());
+        Assert.Empty(CSharpSyntaxTree.ParseText(efCore).GetDiagnostics());
+        Assert.Contains("public class UserPermissionSetting : PermissionSetting", entities);
+        Assert.Contains($"public virtual {userId} {{ get; set; }}", entities);
+        Assert.Contains($"public virtual {roleId} {{ get; set; }}", entities);
+        Assert.Contains(userColumn, efCore);
+        Assert.Contains("WHERE g.ProviderName = 'R'", efCore);
+        Assert.Contains("b.ToTable((string?)null);", efCore); // read-only: no table, not in migrations
+        Assert.Contains(".HasValue<RolePermissionSetting>(\"RolePermissionSetting\")", efCore);
+        Assert.Contains("builder.ConfigureModuleZeroPermissionSettings();", ZeroColumnsStep.EfCoreCode("Acme", "Acme.EntityFrameworkCore", permissionSettings: true));
+        Assert.DoesNotContain("ConfigureModuleZeroPermissionSettings", ZeroColumnsStep.EfCoreCode("Acme", "Acme.EntityFrameworkCore"));
     }
 }
