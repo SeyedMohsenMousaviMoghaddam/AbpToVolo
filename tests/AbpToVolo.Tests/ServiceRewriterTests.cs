@@ -256,4 +256,34 @@ public class ServiceRewriterTests : RewriterTestBase
         AssertNotContains("using Castle", code);
         AssertNotContains("IocManager", code);
     }
+
+    [Fact]
+    public void Jwt_claims_keep_a_single_sub()
+    {
+        const string source = """
+            public class TokenAuthController
+            {
+                private static List<Claim> CreateJwtClaims(ClaimsIdentity identity)
+                {
+                    var claims = identity.Claims.ToList();
+                    var nameIdClaim = claims.First(c => c.Type == ClaimTypes.NameIdentifier);
+                    claims.AddRange(new[]
+                    {
+                        new Claim(JwtRegisteredClaimNames.Sub, nameIdClaim.Value),
+                        new Claim(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString())
+                    });
+                    return claims;
+                }
+            }
+            """;
+
+        var (code, _) = Migrate(source);
+
+        AssertContains("""
+                    var nameIdClaim = claims.First(c => c.Type == ClaimTypes.NameIdentifier);
+                    claims.RemoveAll(c => c.Type == JwtRegisteredClaimNames.Sub);
+                    claims.AddRange(new[]
+            """, code);
+        Assert.Equal(code, Migrate(code).Code); // a second run adds nothing
+    }
 }
