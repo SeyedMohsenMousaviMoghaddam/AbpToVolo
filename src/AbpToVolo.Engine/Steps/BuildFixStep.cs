@@ -1190,6 +1190,18 @@ public sealed partial class BuildFixStep : IMigrationStep
             }, $"IdentityUser.{member} = … → setter method", []);
         }
 
+        // user.PasswordHash = hasher.HashPassword(user, password): ABP.io has no public setter (IdentityUserManager changes it
+        // through the store); the hash is set as Boilerplate did, user.SetProtected(e => e.PasswordHash, …).
+        if (type == "IdentityUser" && member == "PasswordHash" && CompatShimStep.EnsureProtectedSetterShim(context) is { } setterNs)
+        {
+            return new PlannedFix(statement, n =>
+            {
+                var a = (AssignmentExpressionSyntax)((ExpressionStatementSyntax)n).Expression;
+                var receiver = ((MemberAccessExpressionSyntax)a.Left).Expression.WithoutTrivia();
+                return ParseStatement($"{receiver}.SetProtected(e => e.PasswordHash, {a.Right.WithoutTrivia()});").WithTriviaFrom(n);
+            }, "IdentityUser.PasswordHash = … → SetProtected", [setterNs]);
+        }
+
         if (member is "CreatorId" or "LastModifierId" or "DeleterId" or "CreationTime" or "LastModificationTime" or "DeletionTime")
         {
             return new PlannedFix(statement, n => ParseStatement("{ }")
