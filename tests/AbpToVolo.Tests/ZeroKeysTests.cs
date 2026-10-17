@@ -250,4 +250,33 @@ public sealed class ZeroKeysTests : RewriterTestBase
 
         Assert.Equal("    Id = EF.Property<int>(x, \"LegacyId\")", named.ToFullString()); // the line break belongs to "{"
     }
+
+    [Theory]
+    [InlineData("await repo.FindAsync(t => t.Value == v && t.ExpireDate > now)", true)] // repository predicate → EF.Property
+    [InlineData("await keyed.FindAsync(t => t.ExpireDate > now)", true)] // FindAsync(id) overload does not take a lambda
+    [InlineData("list.Where(t => t.ExpireDate > now)", false)] // in memory → EntityShadowProperties.Get
+    public void Missing_column_in_a_repository_predicate_is_an_expression_tree(string call, bool expected)
+    {
+        var source = $$"""
+            using System; using System.Collections.Generic; using System.Linq; using System.Linq.Expressions; using System.Threading.Tasks;
+            class Token { public string Value { get; set; } }
+            interface IRepository<T> { Task<T> FindAsync(Expression<Func<T, bool>> predicate, bool includeDetails = true); }
+            interface IKeyedRepository<T> : IRepository<T> { Task<T> FindAsync(Guid id, bool includeDetails = true); }
+            class C
+            {
+                async Task M(IRepository<Token> repo, IKeyedRepository<Token> keyed, List<Token> list, string v, DateTime now)
+                {
+                    var r = {{call}};
+                }
+            }
+            """;
+        var tree = CSharpSyntaxTree.ParseText(source);
+        var references = ((string)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES")!).Split(Path.PathSeparator)
+            .Select(p => Microsoft.CodeAnalysis.MetadataReference.CreateFromFile(p));
+        var model = CSharpCompilation.Create("T", [tree], references).GetSemanticModel(tree);
+        var access = tree.GetRoot().DescendantNodes().OfType<Microsoft.CodeAnalysis.CSharp.Syntax.MemberAccessExpressionSyntax>()
+            .Single(a => a.Name.Identifier.Text == "ExpireDate");
+
+        Assert.Equal(expected, BuildFixStep.InExpressionTree(model, access));
+    }
 }

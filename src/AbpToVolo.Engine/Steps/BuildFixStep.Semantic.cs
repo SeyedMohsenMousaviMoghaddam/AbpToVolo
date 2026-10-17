@@ -317,15 +317,37 @@ public sealed partial class BuildFixStep
             : null;
 
     /// <summary>Inside a lambda that is converted to an expression tree (an IQueryable operator: translated to SQL).</summary>
-    private static bool InExpressionTree(SemanticModel model, SyntaxNode node) =>
+    internal static bool InExpressionTree(SemanticModel model, SyntaxNode node) =>
         node.Ancestors().OfType<LambdaExpressionSyntax>().Any(lambda =>
             model.GetTypeInfo(lambda).ConvertedType is INamedTypeSymbol { Name: "Expression" } converted &&
             converted.ContainingNamespace.ToDisplayString() == "System.Linq.Expressions" ||
             // The lambda does not bind (it contains the error being fixed): an argument of a LINQ operator on an IQueryable.
             lambda.Parent is ArgumentSyntax { Parent: ArgumentListSyntax { Parent: InvocationExpressionSyntax { Expression: MemberAccessExpressionSyntax call } } } &&
-            IsQueryable(model.GetTypeInfo(call.Expression).Type)) ||
+            IsQueryable(model.GetTypeInfo(call.Expression).Type) ||
+            // ...or an Expression<...> parameter of the called method (repository.FindAsync(t => ...), GetAsync, DeleteAsync...).
+            lambda.Parent is ArgumentSyntax argument && TakesExpression(model, argument)) ||
         // Query syntax (from x in query ... select ...) over an IQueryable.
         node.Ancestors().OfType<QueryExpressionSyntax>().Any(query => IsQueryable(model.GetTypeInfo(query.FromClause.Expression).Type));
+
+    /// <summary>The argument goes to an Expression&lt;...&gt; parameter of every method the call can bind to.</summary>
+    private static bool TakesExpression(SemanticModel model, ArgumentSyntax argument)
+    {
+        if (argument.Parent is not ArgumentListSyntax { Parent: InvocationExpressionSyntax invocation } list) return false;
+        var info = model.GetSymbolInfo(invocation);
+        var candidates = (info.Symbol is { } symbol ? [symbol] : info.CandidateSymbols).OfType<IMethodSymbol>().ToList();
+        if (candidates.Count == 0) candidates = model.GetMemberGroup(invocation.Expression).OfType<IMethodSymbol>().ToList();
+        var index = list.Arguments.IndexOf(argument);
+
+        ITypeSymbol? ParameterType(IMethodSymbol method) => (argument.NameColon is { } name
+            ? method.Parameters.FirstOrDefault(p => p.Name == name.Name.Identifier.Text)
+            : index < method.Parameters.Length ? method.Parameters[index] : null)?.Type;
+        static bool IsExpression(ITypeSymbol? type) => type is INamedTypeSymbol { Name: "Expression", IsGenericType: true } named &&
+                                                       named.ContainingNamespace.ToDisplayString() == "System.Linq.Expressions";
+
+        // Overloads a lambda can go to (FindAsync(id) does not count): all of them take an expression tree.
+        var types = candidates.Select(ParameterType).Where(t => IsExpression(t) || t?.TypeKind == TypeKind.Delegate).ToList();
+        return types.Count > 0 && types.All(IsExpression);
+    }
 
     private static bool IsQueryable(ITypeSymbol? type) =>
         type is not null && (type.Name == "IQueryable" || type.AllInterfaces.Any(i => i.Name == "IQueryable" && i.ContainingNamespace.ToDisplayString() == "System.Linq"));
