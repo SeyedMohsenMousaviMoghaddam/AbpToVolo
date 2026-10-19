@@ -344,7 +344,7 @@ public class ServiceRewriterTests : RewriterTestBase
 
         var (code, _) = Migrate(source);
 
-        AssertContains("Names = string.Join(\", \", g.Select(y => y.Name).Distinct().AsEnumerable()),", code);
+        AssertContains("Names = string.Join(\", \", g.Select(y => y.Name).ToHashSet()),", code);
         AssertContains("All = string.Join(\", \", g.Select(y => y.Name))", code);
         Assert.Equal(code, Migrate(code).Code); // a second run adds nothing
     }

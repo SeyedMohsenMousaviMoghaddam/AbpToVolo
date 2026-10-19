@@ -7,10 +7,10 @@ namespace AbpToVolo.CodeMigration.Rewriters;
 
 /// <summary>
 /// EF Core 10 translates string.Join over a distinct sequence inside a query to STRING_AGG(DISTINCT ...), which SQL Server
-/// does not accept ("Incorrect syntax near ','"); EF Core 8 fetched the values and joined them in memory. AsEnumerable()
-/// after Distinct() keeps the DISTINCT in SQL and joins in memory again (no change for in-memory sequences):
+/// does not accept ("Incorrect syntax near ','"); EF Core 8 fetched the values and joined them in memory. ToHashSet()
+/// fetches the values again (AsEnumerable() is dropped by EF) and keeps Distinct's result: same comparer, first-seen order:
 ///   string.Join(", ", g.Select(x => x.Name).Distinct())
-///   → string.Join(", ", g.Select(x => x.Name).Distinct().AsEnumerable())
+///   → string.Join(", ", g.Select(x => x.Name).ToHashSet())
 /// </summary>
 public sealed class StringJoinDistinctRewriter : MigrationRewriter
 {
@@ -35,10 +35,9 @@ public sealed class StringJoinDistinctRewriter : MigrationRewriter
             return visited;
         }
 
-        Context.Change("string.Join(..., Distinct()) → Distinct().AsEnumerable() (EF Core 10 would send STRING_AGG(DISTINCT), invalid on SQL Server)");
-        var asEnumerable = InvocationExpression(MemberAccessExpression(SyntaxKind.SimpleMemberAccessExpression,
-            distinct.WithoutTrailingTrivia(), IdentifierName("AsEnumerable"))).WithTrailingTrivia(distinct.GetTrailingTrivia());
+        Context.Change("string.Join(..., Distinct()) → ToHashSet() (EF Core 10 would send STRING_AGG(DISTINCT), invalid on SQL Server)");
+        var toHashSet = distinct.WithExpression(((MemberAccessExpressionSyntax)distinct.Expression).WithName(IdentifierName("ToHashSet")));
         return visited.WithArgumentList(visited.ArgumentList.WithArguments(
-            visited.ArgumentList.Arguments.Replace(visited.ArgumentList.Arguments[1], visited.ArgumentList.Arguments[1].WithExpression(asEnumerable))));
+            visited.ArgumentList.Arguments.Replace(visited.ArgumentList.Arguments[1], visited.ArgumentList.Arguments[1].WithExpression(toHashSet))));
     }
 }
