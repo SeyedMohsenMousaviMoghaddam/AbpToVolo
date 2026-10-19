@@ -49,6 +49,7 @@ public sealed class RenameLayersStep : IMigrationStep
             if (Path.GetFileName(project.Directory) == project.Name)
             {
                 var newDirectory = Path.Combine(Path.GetDirectoryName(project.Directory)!, newName);
+                DeleteBuildLeftovers(newDirectory);
                 Directory.Move(project.Directory, newDirectory);
             }
 
@@ -94,5 +95,18 @@ public sealed class RenameLayersStep : IMigrationStep
         }
 
         return text;
+    }
+
+    /// <summary>
+    /// An IDE that has the output solution open restores it while the output is replaced and recreates bin/obj of the
+    /// renamed projects (e.g. Acme.Domain/obj), which would stop the folder rename: a folder with nothing else is removed.
+    /// </summary>
+    internal static void DeleteBuildLeftovers(string directory)
+    {
+        if (Directory.Exists(directory) &&
+            Directory.EnumerateFileSystemEntries(directory).All(e => Path.GetFileName(e) is "bin" or "obj" && Directory.Exists(e)))
+        {
+            Directory.Delete(directory, recursive: true);
+        }
     }
 }

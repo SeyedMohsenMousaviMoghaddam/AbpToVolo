@@ -41,6 +41,30 @@ public class HelperTests
         Assert.Contains("\"Acme.Web.Core\", \"src\\Acme.Web.Core\\Acme.Web.Core.csproj\"", result);
     }
 
+    [Fact]
+    public void Rename_target_with_only_build_output_is_removed()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "abptovolo-" + Guid.NewGuid().ToString("N"));
+        var leftovers = Path.Combine(root, "Acme.Domain");
+        var kept = Path.Combine(root, "Acme.Application");
+        Directory.CreateDirectory(Path.Combine(leftovers, "obj", "Debug"));
+        File.WriteAllText(Path.Combine(leftovers, "obj", "project.assets.json"), "{}");
+        Directory.CreateDirectory(Path.Combine(kept, "obj"));
+        File.WriteAllText(Path.Combine(kept, "Class1.cs"), "");
+        try
+        {
+            RenameLayersStep.DeleteBuildLeftovers(leftovers);
+            RenameLayersStep.DeleteBuildLeftovers(kept);
+
+            Assert.False(Directory.Exists(leftovers));
+            Assert.True(File.Exists(Path.Combine(kept, "Class1.cs")));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
     [Theory]
     [InlineData("PhoneBook-fa.xml", "fa", "PhoneBook")]
     [InlineData("PhoneBook.xml", "en", "PhoneBook")]
