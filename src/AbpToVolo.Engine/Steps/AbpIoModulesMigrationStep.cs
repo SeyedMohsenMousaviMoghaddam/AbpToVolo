@@ -130,6 +130,10 @@ public sealed partial class AbpIoModulesMigrationStep : IMigrationStep
                 .WithLeadingTrivia(EndOfLine(nl), Whitespace(indent), Comment("// AbpToVolo: recreates the views saved by RenameModuleZeroTables (audit column names updated)."),
                     EndOfLine(nl), Whitespace(indent))
                 .WithTrailingTrivia(EndOfLine(nl)));
+            newUp.Add(ParseStatement("migrationBuilder.Sql(@\"IF OBJECT_ID(N'dbo.Zero_ConvertModules', N'P') IS NOT NULL EXEC dbo.Zero_ConvertModules;\");")
+                .WithLeadingTrivia(Whitespace(indent), Comment("// AbpToVolo: procedures/functions recreated for the ABP.io columns (audit names, Guid TenantId compared with an int @TenantId)."),
+                    EndOfLine(nl), Whitespace(indent))
+                .WithTrailingTrivia(EndOfLine(nl)));
         }
 
         var replacements = new Dictionary<SyntaxNode, SyntaxNode> { [up.Body] = up.Body.WithStatements(List(newUp)) };

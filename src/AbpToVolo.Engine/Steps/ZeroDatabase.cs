@@ -200,22 +200,57 @@ internal static class ZeroDatabase
         BEGIN
             -- AbpToVolo: rewrites a Boilerplate view definition for the ABP.io tables; Zero_RecreateViews tries it only
             -- after the definition itself failed.
-            DECLARE @at int, @end int, @pos int, @hit int, @alias sysname;
+            DECLARE @at int, @end int, @pos int, @hit int, @alias sysname, @id uniqueidentifier, @variant int, @column nvarchar(40);
             IF @mode = 0
             BEGIN
                 -- AbpSettings (TenantId/UserId columns) → the ABP.io settings with those columns
                 SET @sql = REPLACE(REPLACE(REPLACE(@sql, N'[dbo].[AbpSettings]', N'dbo.Zero_BoilerplateSettings'),
                     N'dbo.AbpSettings', N'dbo.Zero_BoilerplateSettings'), N' AbpSettings', N' dbo.Zero_BoilerplateSettings');
-                -- TenantId = 1 (an int tenant id) → the Guid id of that tenant
+                -- TenantId = 1 (an int tenant id) → the Guid id of that tenant, as a literal (no Zero_IdMap at run time)
                 SET @sql = REPLACE(@sql, N'TenantId=', N'TenantId = ');
                 SET @at = PATINDEX(N'%TenantId = [0-9]%', @sql);
                 WHILE @at > 0
                 BEGIN
                     SET @at += 11;
                     SET @end = PATINDEX(N'%[^0-9]%', SUBSTRING(@sql, @at, 30) + N' ');
-                    SET @sql = STUFF(@sql, @at, @end - 1,
-                        N'(SELECT NewId FROM dbo.Zero_IdMap WHERE EntityType = N''Tenant'' AND OldId = ' + SUBSTRING(@sql, @at, @end - 1) + N')');
+                    SET @id = (SELECT NewId FROM dbo.Zero_IdMap WHERE EntityType = N'Tenant' AND OldId = CAST(SUBSTRING(@sql, @at, @end - 1) AS bigint));
+                    SET @sql = STUFF(@sql, @at, @end - 1, CASE WHEN @id IS NULL THEN N'NULL' ELSE N'''' + CAST(@id AS nvarchar(36)) + N'''' END);
                     SET @at = PATINDEX(N'%TenantId = [0-9]%', @sql);
+                END
+                -- 1 AS CreatorUserId (an int user id, renamed CreatorId) → the Guid id of that user, as a literal
+                SET @variant = 0;
+                WHILE @variant < 3
+                BEGIN
+                    SET @column = CASE @variant WHEN 0 THEN N' AS CreatorId' WHEN 1 THEN N' AS LastModifierId' ELSE N' AS DeleterId' END;
+                    SET @at = CHARINDEX(@column, @sql);
+                    WHILE @at > 0
+                    BEGIN
+                        SET @end = @at;
+                        WHILE @end > 1 AND SUBSTRING(@sql, @end - 1, 1) LIKE N'[0-9]' SET @end -= 1;
+                        IF @end < @at AND (@end = 1 OR SUBSTRING(@sql, @end - 1, 1) NOT LIKE N'[A-Za-z0-9_.@]')
+                        BEGIN
+                            SET @id = (SELECT NewId FROM dbo.Zero_IdMap WHERE EntityType = N'User' AND OldId = CAST(SUBSTRING(@sql, @end, @at - @end) AS bigint));
+                            SET @sql = STUFF(@sql, @end, @at - @end, CASE WHEN @id IS NULL THEN N'CAST(NULL AS uniqueidentifier)' ELSE N'CAST(''' + CAST(@id AS nvarchar(36)) + N''' AS uniqueidentifier)' END);
+                            SET @at = CHARINDEX(@column, @sql, @end + 1);
+                        END
+                        ELSE SET @at = CHARINDEX(@column, @sql, @at + 1);
+                    END
+                    SET @variant += 1;
+                END
+                -- AbpTenants t ... t.Id = @TenantId (an int tenant id) → t.LegacyId when the tenants keep their source id
+                SET @pos = 1;
+                WHILE COL_LENGTH(N'dbo.AbpTenants', N'LegacyId') IS NOT NULL
+                BEGIN
+                    SET @hit = PATINDEX(N'%AbpTenants [A-Za-z_]%', SUBSTRING(@sql, @pos, LEN(@sql)));
+                    IF @hit = 0 BREAK;
+                    SET @at = @pos + @hit + 10;
+                    IF SUBSTRING(@sql, @at, 3) = N'AS ' SET @at += 3;
+                    SET @end = PATINDEX(N'%[^A-Za-z0-9_]%', SUBSTRING(@sql, @at, 200) + N' ');
+                    SET @alias = SUBSTRING(@sql, @at, @end - 1);
+                    IF @alias NOT IN (N'ON', N'WITH', N'WHERE', N'JOIN', N'LEFT', N'INNER', N'GROUP', N'ORDER')
+                        SET @sql = REPLACE(REPLACE(@sql, @alias + N'.Id = @TenantId', @alias + N'.LegacyId = @TenantId'),
+                            @alias + N'.Id=@TenantId', @alias + N'.LegacyId=@TenantId');
+                    SET @pos = @at + 1;
                 END
             END
             ELSE
@@ -237,6 +272,92 @@ internal static class ZeroDatabase
                 END
             END
             RETURN @sql;
+        END
+        """;
+
+    /// <summary>
+    /// Stored procedures and functions written against the Boilerplate schema: each is created again (CREATE OR ALTER)
+    /// with the ABP.io audit column names, and when it takes the tenant as an int (@TenantId int) "TenantId = @TenantId"
+    /// compares the Guid TenantId columns with the Guid of that tenant (the parameter, and so the application's calls,
+    /// keep the int; otherwise "Operand type clash: uniqueidentifier is incompatible with int" when it runs). One that
+    /// still fails is retried rewritten by Zero_ViewCompatSql like the views; one that never compiles is kept as it was
+    /// and listed.
+    /// </summary>
+    internal const string ConvertModulesProcedureSql = """
+        CREATE OR ALTER PROCEDURE dbo.Zero_ConvertModules
+        AS
+        BEGIN
+            SET NOCOUNT ON;
+            SET XACT_ABORT OFF;
+            DECLARE @name nvarchar(300), @param sysname, @sql nvarchar(max), @base nvarchar(max), @new nvarchar(max),
+                @pattern nvarchar(300), @expr nvarchar(400), @variant int, @at int, @word nvarchar(20), @attempt int,
+                @done bit, @error nvarchar(4000), @failed nvarchar(max) = N'';
+            DECLARE modules CURSOR LOCAL FAST_FORWARD FOR
+                SELECT QUOTENAME(SCHEMA_NAME(o.schema_id)) + N'.' + QUOTENAME(o.name), p.name, m.definition
+                FROM sys.objects o
+                JOIN sys.sql_modules m ON m.object_id = o.object_id
+                LEFT JOIN sys.parameters p ON p.object_id = o.object_id AND p.name = N'@TenantId' AND TYPE_NAME(p.user_type_id) IN (N'int', N'bigint')
+                WHERE o.is_ms_shipped = 0 AND o.type IN ('P', 'FN', 'IF', 'TF') AND o.name NOT LIKE N'Zero[_]%' AND m.is_schema_bound = 0;
+            OPEN modules;
+            FETCH NEXT FROM modules INTO @name, @param, @sql;
+            WHILE @@FETCH_STATUS = 0
+            BEGIN
+                SET @base = REPLACE(REPLACE(REPLACE(@sql, N'CreatorUserId', N'CreatorId'), N'LastModifierUserId', N'LastModifierId'), N'DeleterUserId', N'DeleterId');
+                IF @param IS NOT NULL
+                BEGIN
+                    SET @expr = CASE WHEN COL_LENGTH(N'dbo.AbpTenants', N'LegacyId') IS NOT NULL
+                        THEN N'(SELECT zt.Id FROM dbo.AbpTenants zt WHERE zt.LegacyId = ' + @param + N')'
+                        ELSE N'(SELECT zm.NewId FROM dbo.Zero_IdMap zm WHERE zm.EntityType = N''Tenant'' AND zm.OldId = ' + @param + N')' END;
+                    SET @variant = 0;
+                    WHILE @variant < 2
+                    BEGIN
+                        SET @pattern = CASE @variant WHEN 0 THEN N'TenantId = ' ELSE N'TenantId=' END + @param;
+                        SET @at = CHARINDEX(@pattern, @base);
+                        WHILE @at > 0
+                        BEGIN
+                            -- the column side only (not "@TenantId = @TenantId"), the whole parameter name (not @TenantIds)
+                            IF (@at = 1 OR SUBSTRING(@base, @at - 1, 1) <> N'@') AND SUBSTRING(@base, @at + LEN(@pattern), 1) NOT LIKE N'[A-Za-z0-9_]'
+                            BEGIN
+                                SET @base = STUFF(@base, @at + LEN(@pattern) - LEN(@param), LEN(@param), @expr);
+                                SET @at = CHARINDEX(@pattern, @base, @at + LEN(@pattern) - LEN(@param) + LEN(@expr));
+                            END
+                            ELSE SET @at = CHARINDEX(@pattern, @base, @at + 1);
+                        END
+                        SET @variant += 1;
+                    END
+                END
+
+                -- CREATE → CREATE OR ALTER: the CREATE followed by PROC/FUNCTION (not "-- Create date:" of a template header)
+                SET @at = CHARINDEX(N'CREATE', @base);
+                WHILE @at > 0
+                BEGIN
+                    SET @word = LEFT(LTRIM(REPLACE(REPLACE(REPLACE(SUBSTRING(@base, @at + 6, 40), NCHAR(9), N' '), NCHAR(13), N' '), NCHAR(10), N' ')), 8);
+                    IF @word LIKE N'PROC%' OR @word LIKE N'FUNCTION' OR @word LIKE N'OR ALTER' BREAK;
+                    SET @at = CHARINDEX(N'CREATE', @base, @at + 6);
+                END
+                IF @at > 0 AND @word NOT LIKE N'OR ALTER' SET @base = STUFF(@base, @at, 6, N'CREATE OR ALTER');
+
+                SELECT @attempt = 0, @done = 0, @error = NULL;
+                WHILE @at > 0 AND @done = 0 AND @attempt <= 2
+                BEGIN
+                    SET @new = @base;
+                    IF @attempt >= 1 SET @new = dbo.Zero_ViewCompatSql(@new, 0);
+                    IF @attempt >= 2 SET @new = dbo.Zero_ViewCompatSql(@new, 1);
+                    BEGIN TRY
+                        EXEC sp_executesql @new;
+                        SET @done = 1;
+                    END TRY
+                    BEGIN CATCH
+                        IF @attempt = 0 SET @error = ERROR_MESSAGE();
+                        SET @attempt += 1;
+                    END CATCH
+                END
+                IF @done = 0 SET @failed += @name + N': ' + ISNULL(@error, N'CREATE not found') + NCHAR(10);
+                FETCH NEXT FROM modules INTO @name, @param, @sql;
+            END
+            CLOSE modules;
+            DEALLOCATE modules;
+            IF @failed <> N'' PRINT N'AbpToVolo: procedures/functions to fix by hand (kept as they were):' + NCHAR(10) + @failed;
         END
         """;
 
@@ -324,6 +445,7 @@ internal static class ZeroDatabase
 
                         migrationBuilder.Sql(@"{{ViewCompatFunctionSql.Replace("\"", "\"\"")}}");
                         migrationBuilder.Sql(@"{{RecreateViewsProcedureSql.Replace("\"", "\"\"")}}");
+                        migrationBuilder.Sql(@"{{ConvertModulesProcedureSql.Replace("\"", "\"\"")}}");
 
                         migrationBuilder.Sql(@"{{up.Replace("\"", "\"\"")}}");
                     }
