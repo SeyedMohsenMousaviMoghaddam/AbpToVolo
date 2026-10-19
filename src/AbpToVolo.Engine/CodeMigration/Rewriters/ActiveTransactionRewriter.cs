@@ -103,20 +103,22 @@ public sealed class ActiveTransactionRewriter : MigrationRewriter
             return null;
         }
 
+        // Boilerplate's provider started the unit of work's transaction (the connection was open): the generated
+        // DbContextTransactionCompatExtensions open the connection too (ABP.io starts no transaction for GET requests).
+        var isAsync = SyntaxHelpers.IsInsideAsyncFunction(expression);
         var member = access.Name.Identifier.Text switch
         {
-            "GetActiveTransactionAsync" or "GetActiveTransaction" => "Database.CurrentTransaction?.GetDbTransaction()",
-            "GetActiveConnectionAsync" or "GetActiveConnection" => "Database.GetDbConnection()",
+            "GetActiveTransactionAsync" or "GetActiveTransaction" => isAsync ? "GetActiveTransactionCompatAsync" : "GetActiveTransactionCompat",
+            "GetActiveConnectionAsync" or "GetActiveConnection" => isAsync ? "GetActiveConnectionCompatAsync" : "GetActiveConnectionCompat",
             _ => null
         };
         if (member is null) return null;
 
-        var isAsync = SyntaxHelpers.IsInsideAsyncFunction(expression);
-        var dbContext = isAsync ? "(await GetDbContextAsync())" : "GetDbContextAsync().GetAwaiter().GetResult()";
-        Context.Change($"IActiveTransactionProvider.{access.Name.Identifier.Text} → DbContext.{member.Split('?')[0]}");
+        Context.Change($"IActiveTransactionProvider.{access.Name.Identifier.Text} → DbContext.{member} (connection opened)");
         Context.RequireUsing("Microsoft.EntityFrameworkCore");
-        Context.RequireUsing("Microsoft.EntityFrameworkCore.Storage");
-        var result = ParseExpression($"{dbContext}.{member}");
+        var result = isAsync
+            ? ParseExpression($"await (await GetDbContextAsync()).{member}()")
+            : ParseExpression($"GetDbContextAsync().GetAwaiter().GetResult().{member}()");
         return ParenthesizedExpression(result);
     }
 }

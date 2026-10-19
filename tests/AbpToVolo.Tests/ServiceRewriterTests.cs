@@ -258,6 +258,47 @@ public class ServiceRewriterTests : RewriterTestBase
     }
 
     [Fact]
+    public void Castle_logger_in_a_constructor_becomes_a_typed_logger()
+    {
+        const string source = """
+            using Castle.Core.Logging;
+            public class MyFilter
+            {
+                private readonly ILogger _logger;
+                public MyFilter(ILogger logger) { _logger = logger; }
+            }
+            """;
+
+        var (code, _) = Migrate(source);
+
+        AssertContains("public MyFilter(ILogger<MyFilter> logger)", code);
+        AssertContains("private readonly ILogger _logger;", code);
+        AssertContains("using Microsoft.Extensions.Logging;", code);
+    }
+
+    [Fact]
+    public void Fully_qualified_boilerplate_types_are_mapped()
+    {
+        const string source = """
+            namespace Acme.Reports
+            {
+                public class Report
+                {
+                    public object Parameters = new List<Abp.Application.Services.Dto.NameValueDto> { new Abp.Application.Services.Dto.NameValueDto() };
+                    public object Page() => new Abp.Application.Services.Dto.PagedResultDto<string>();
+                }
+            }
+            """;
+
+        var (code, _) = Migrate(source);
+
+        AssertContains("new List<NameValue> { new NameValue() }", code);
+        AssertContains("new PagedResultDto<string>()", code);
+        AssertContains("using Volo.Abp.Application.Dtos;", code);
+        AssertNotContains("Abp.Application.Services.Dto", code);
+    }
+
+    [Fact]
     public void Jwt_claims_keep_a_single_sub()
     {
         const string source = """

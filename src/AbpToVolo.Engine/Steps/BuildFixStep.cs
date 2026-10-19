@@ -542,19 +542,45 @@ public sealed partial class BuildFixStep : IMigrationStep
             // PermissionManager.GetAllPermissions(): Boilerplate's base-class IPermissionManager; in ABP.io the name is the
             // PermissionManager class of Volo.Abp.PermissionManagement.
             "CS0117" when error.Message.StartsWith("'PermissionManager' does not contain", StringComparison.Ordinal) &&
-                          CompatShimStep.EnsurePermissionManagerShim(context) is { } shimNs => PlanAmbientMembers(token, shimNs),
+                          CompatShimStep.EnsurePermissionManagerShim(context) is { } shimNs => PlanAmbientMembers(token, shimNs, "PermissionManager"),
             "CS0103" when error.Message.Contains("'PermissionManager'", StringComparison.Ordinal) &&
-                          CompatShimStep.EnsurePermissionManagerShim(context) is { } shimNs => PlanAmbientMembers(token, shimNs),
+                          CompatShimStep.EnsurePermissionManagerShim(context) is { } shimNs => PlanAmbientMembers(token, shimNs, "PermissionManager"),
+            // new IdentityUser { … } / new IdentityRole() / new Tenant(): protected constructors, setters and Zero columns.
+            "CS0122" when InaccessibleModuleEntityConstructor().IsMatch(error.Message) && PlanModuleEntityCreation(context, token) is { } created => created,
+            "CS0272" or "CS0117" when PlanModuleEntityCreation(context, token) is { } initialized => initialized,
+            "CS1061" when MissingMember().Match(error.Message) is { Success: true } zm &&
+                          PlanZeroManagerCall(context, token, Simple(zm.Groups["type"].Value), zm.Groups["member"].Value) is { } managerCall => managerCall,
+            "CS1061" when MissingMember().Match(error.Message) is { Success: true } sm &&
+                          PlanSettingStoreType(token, Simple(sm.Groups["type"].Value), sm.Groups["member"].Value) is { } settingStore => settingStore,
+            "CS1061" when MissingMember().Match(error.Message) is { Success: true } em &&
+                          PlanZeroEntityMember(context, token, Simple(em.Groups["type"].Value), em.Groups["member"].Value) is { } entityMember => entityMember,
+            "CS0411" or "CS1061" when error.Message.Contains("GetByIdAsync", StringComparison.Ordinal) && PlanTenantManagerGetById(token) is { } tenantById => tenantById,
             "CS1061" or "CS0117" when MissingMember().Match(error.Message) is { Success: true } m =>
                 PlanMissingMember(context, token, Simple(m.Groups["type"].Value), m.Groups["member"].Value),
             "CS1929" when LocalizedStringMember().Match(error.Message) is { Success: true } m => PlanLocalizedString(token, m.Groups["member"].Value),
             "CS0120" when error.Message.Contains("'Clock.Now'", StringComparison.Ordinal) || error.Message.Contains(".Clock'", StringComparison.Ordinal) => PlanClockNow(token),
             "CS0120" when StaticReference().Match(error.Message) is { Success: true } m && AmbientMembers.ContainsKey(m.Groups["name"].Value) =>
-                PlanAmbientMembers(token),
+                PlanAmbientMembers(token, trigger: m.Groups["name"].Value),
+            // SettingManager.GetSettingValueForApplication(…) in a class without SettingManager: the compiler names the extension
+            // class (SettingManagerCompatExtensions), the receiver tells which member is missing.
+            "CS0120" when token.Parent?.AncestorsAndSelf().OfType<MemberAccessExpressionSyntax>().FirstOrDefault()?.Expression is IdentifierNameSyntax { Identifier.Text: var receiverName } &&
+                          AmbientMembers.ContainsKey(receiverName) => PlanAmbientMembers(token, trigger: receiverName),
+            // CurrentUser.GetLegacyId() in a class without CurrentUser: "CurrentUser" is the Volo.Abp.Users.CurrentUser type there.
+            "CS0120" when error.Message.Contains("GetLegacyId(ICurrentUser)", StringComparison.Ordinal) => PlanAmbientMembers(token, trigger: "CurrentUser"),
             "CS0103" when UnknownName().Match(error.Message) is { Success: true } m && AmbientMembers.ContainsKey(m.Groups["name"].Value) =>
-                PlanAmbientMembers(token),
+                PlanAmbientMembers(token, trigger: m.Groups["name"].Value),
             "CS0103" when error.Message.Contains("'SimpleStringCipher'", StringComparison.Ordinal) => PlanStringCipher(token),
             "CS0201" => PlanUnusedId(token),
+            "CS0246" when PlanPermissionManagerType(context, token, error.Message) is { } permissionManager => permissionManager,
+            "CS0246" when error.Message.Contains("'UnitOfWorkOptions'", StringComparison.Ordinal) && PlanUnitOfWorkOptions(token) is { } unitOfWork => unitOfWork,
+            "CS0103" when PlanCrudPermissionCheck(token) is { } crudCheck => crudCheck,
+            "CS0103" when PlanRepositoryContext(token) is { } repositoryContext => repositoryContext,
+            // antiForgeryManager.SetCookie(HttpContext): ABP.io's IAbpAntiForgeryManager.SetCookie() uses the current request.
+            "CS1501" when error.Message.Contains("'SetCookie'", StringComparison.Ordinal) &&
+                          token.Parent?.AncestorsAndSelf().OfType<InvocationExpressionSyntax>().FirstOrDefault() is { Expression: MemberAccessExpressionSyntax { Name.Identifier.Text: "SetCookie" } } setCookie =>
+                new PlannedFix(setCookie, n => ((InvocationExpressionSyntax)n).WithArgumentList(ArgumentList()), "SetCookie(httpContext) → SetCookie()", []),
+            "CS0411" when error.Message.Contains("SetProtected", StringComparison.Ordinal) && PlanAuditUserIdValue(context, token) is { } auditUser => auditUser,
+            "CS0144" when error.Message.Contains("'EntityDto<", StringComparison.Ordinal) && PlanAbstractEntityDto(context, token) is { } entityDto => entityDto,
             "CS0234" or "CS0246" when token.Parent?.AncestorsAndSelf().OfType<UsingDirectiveSyntax>().FirstOrDefault() is { Alias: null, StaticKeyword.RawKind: 0 } directive =>
                 new PlannedFix(directive, n => n.WithAdditionalAnnotations(Remove), "using of a namespace that does not exist in ABP.io → removed", []),
             "CS1729" when error.Message.Contains("'UnitOfWorkAttribute'", StringComparison.Ordinal) => PlanUnitOfWorkAttribute(token),
@@ -569,6 +595,16 @@ public sealed partial class BuildFixStep : IMigrationStep
             "CS0104" when AmbiguousReference().Match(error.Message) is { Success: true } m => PlanAmbiguousReference(token, m.Groups["a"].Value, m.Groups["b"].Value),
             _ => null
         };
+    }
+
+    /// <summary>IPermissionManager _permissionManager (Boilerplate's, injected) → the generated BoilerplatePermissionManager.</summary>
+    private static PlannedFix? PlanPermissionManagerType(MigrationContext context, SyntaxToken token, string message)
+    {
+        if (!message.Contains("'IPermissionManager'", StringComparison.Ordinal) && !message.Contains("'PermissionManager'", StringComparison.Ordinal)) return null;
+        if (token.Parent is not IdentifierNameSyntax { Parent: not (MemberAccessExpressionSyntax or QualifiedNameSyntax) } typeName) return null;
+        if (CompatShimStep.EnsurePermissionManagerShim(context) is not { } ns) return null;
+        return new PlannedFix(typeName, n => IdentifierName("BoilerplatePermissionManager").WithTriviaFrom(n),
+            "Boilerplate's IPermissionManager → BoilerplatePermissionManager", [ns]);
     }
 
     /// <summary>
@@ -620,13 +656,18 @@ public sealed partial class BuildFixStep : IMigrationStep
         ["LocalizationManager"] = ("Microsoft.Extensions.Localization", "public IStringLocalizerFactory LocalizationManager { get; set; }"),
         // Boilerplate repositories had MultiTenancySide; ABP.io repositories have CurrentTenant
         ["MultiTenancySide"] = ("Volo.Abp.MultiTenancy", "protected MultiTenancySides MultiTenancySide => CurrentTenant.IsAvailable ? MultiTenancySides.Tenant : MultiTenancySides.Host;"),
+        // Used by fixes that resolve services (LazyServiceProvider.LazyGetRequiredService<…>()) in classes without an ABP.io base class.
+        ["LazyServiceProvider"] = ("Volo.Abp.DependencyInjection", "public IAbpLazyServiceProvider LazyServiceProvider { get; set; }"),
+        // L["key"] of Boilerplate's base classes (DomainService, managers): the default localization resource.
+        ["StringLocalizerFactory"] = ("Microsoft.Extensions.Localization", "public IStringLocalizerFactory StringLocalizerFactory { get; set; }"),
+        ["L"] = ("Volo.Abp.Localization", "protected IStringLocalizer L => StringLocalizerFactory.CreateDefaultOrNull()!;"),
         // Boilerplate's IPermissionManager (GetAllPermissions...) → generated BoilerplatePermissionManager (namespace of the shims).
         ["PermissionManager"] = (ShimNamespace, "public BoilerplatePermissionManager PermissionManager { get; set; }"),
     };
 
     private const string ShimNamespace = "{shims}";
 
-    private static PlannedFix? PlanAmbientMembers(SyntaxToken token, string? shimNamespace = null)
+    private static PlannedFix? PlanAmbientMembers(SyntaxToken token, string? shimNamespace = null, string? trigger = null)
     {
         var cls = token.Parent?.AncestorsAndSelf().OfType<ClassDeclarationSyntax>().FirstOrDefault();
         if (cls is null || cls.Modifiers.Any(SyntaxKind.StaticKeyword)) return null;
@@ -646,7 +687,11 @@ public sealed partial class BuildFixStep : IMigrationStep
             .Select(n => n.Identifier.Text)
             .Where(n => !declared.Contains(n))
             .ToHashSet(StringComparer.Ordinal);
+        // A class with a base class (ApplicationService, DomainService…) inherits most of these: only the name the compiler
+        // reported is declared — a new property would hide the inherited one (and stay null without property injection).
+        if (trigger is not null && cls.BaseList is not null) needed.IntersectWith([trigger]);
         if (needed.Contains("CurrentUnitOfWork") && !declared.Contains("UnitOfWorkManager")) needed.Add("UnitOfWorkManager");
+        if (needed.Contains("L") && !declared.Contains("StringLocalizerFactory")) needed.Add("StringLocalizerFactory");
         if (needed.Count == 0) return null;
 
         var names = needed.OrderBy(n => n == "CurrentUnitOfWork" ? 1 : 0).ThenBy(n => n, StringComparer.Ordinal).ToList();
@@ -1209,7 +1254,7 @@ public sealed partial class BuildFixStep : IMigrationStep
                 .WithTrailingTrivia(n.GetTrailingTrivia()), $"{member} is set by ABP.io auditing (assignment removed)", []);
         }
 
-        return null;
+        return PlanModuleEntitySetter(context, statement, type, member);
     }
 
     [GeneratedRegex(@"'(?<type>[^']+)' does not contain a definition for '(?<member>\w+)'")]

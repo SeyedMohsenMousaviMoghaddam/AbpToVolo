@@ -112,11 +112,13 @@ public sealed class ContractsStep : IMigrationStep
 
         BlockReverseReferences(context, units);
         ResolveFixpoint(units);
+        var duplicates = MergeDuplicates(units, application);
         AddAbpTypePackages(context, units, shared, contracts);
 
         var moved = units.Where(u => u.Moving).ToList();
         var constsClasses = PlanConstsClasses(model, moved);
         Apply(context, model, units, shared, contracts, constsClasses);
+        RemoveDuplicates(context, duplicates);
         WriteConstsClasses(context, shared, constsClasses);
         WriteProfile(context, application, moved);
         WriteModules(context, domain, application, shared, contracts);
@@ -412,6 +414,53 @@ public sealed class ContractsStep : IMigrationStep
             }
         }
         while (changed);
+    }
+
+    /// <summary>
+    /// The same type (same full name, same code) in the application and the domain: in the source the application's copy won
+    /// in its own project; once moved, the Contracts and Domain.Shared copies would be ambiguous (CS0433). The application's
+    /// copy is dropped and the Domain.Shared one serves everyone.
+    /// </summary>
+    private static List<Unit> MergeDuplicates(List<Unit> units, ProjectInfo application)
+    {
+        var shared = units.Where(u => u.Project != application && u.Final == Target.Shared && u.Decl is BaseTypeDeclarationSyntax)
+            .GroupBy(u => $"{u.Namespace}.{u.Name}", StringComparer.Ordinal)
+            .ToDictionary(g => g.Key, g => g.First(), StringComparer.Ordinal);
+        var duplicates = new List<Unit>();
+        foreach (var unit in units.Where(u => u.Project == application && u.Decl is BaseTypeDeclarationSyntax))
+        {
+            if (!shared.TryGetValue($"{unit.Namespace}.{unit.Name}", out var other)) continue;
+            if (SyntaxFactory.AreEquivalent(unit.Decl, other.Decl))
+            {
+                unit.Candidate = Target.None;
+                unit.Fixed = Target.Shared;
+                duplicates.Add(unit);
+                continue;
+            }
+
+            // A different type of the same name: it stays in the application, which sees its own copy first (as in the
+            // source); the types that use it stay with it.
+            if (unit.Moving) unit.BlockReason = $"another {unit.Name} of the same namespace is in {other.Project.Name}";
+        }
+
+        if (units.Any(u => u.BlockReason?.StartsWith("another ", StringComparison.Ordinal) == true)) ResolveFixpoint(units);
+        return duplicates;
+    }
+
+    private void RemoveDuplicates(MigrationContext context, List<Unit> duplicates)
+    {
+        foreach (var file in duplicates.GroupBy(u => u.File, StringComparer.OrdinalIgnoreCase))
+        {
+            if (!File.Exists(file.Key)) continue;
+            var (text, encoding) = FileSystem.ReadText(file.Key);
+            var root = CSharpSyntaxTree.ParseText(text).GetCompilationUnitRoot();
+            var names = file.Select(u => u.Name).ToHashSet(StringComparer.Ordinal);
+            var remove = root.DescendantNodes().OfType<BaseTypeDeclarationSyntax>().Where(t => names.Contains(t.Identifier.Text) && t.Parent is BaseNamespaceDeclarationSyntax or CompilationUnitSyntax).ToList();
+            var rest = root.RemoveNodes(remove, SyntaxRemoveOptions.KeepNoTrivia)!;
+            if (!rest.DescendantNodes().OfType<MemberDeclarationSyntax>().Any(m => m is BaseTypeDeclarationSyntax or DelegateDeclarationSyntax)) File.Delete(file.Key);
+            else FileSystem.WriteText(file.Key, rest.ToFullString(), encoding);
+            context.Report.Change(Name, $"Removed {string.Join(", ", names)} (the same type is in Domain.Shared; both copies would be ambiguous)", context.Relative(file.Key));
+        }
     }
 
     private static bool IsAllowed(Unit unit, Unit dependency) =>

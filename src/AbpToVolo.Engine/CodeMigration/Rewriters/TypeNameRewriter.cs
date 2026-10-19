@@ -62,6 +62,36 @@ public sealed class TypeNameRewriter : MigrationRewriter
         return base.VisitIdentifierName(node);
     }
 
+    /// <summary>
+    /// Fully qualified Boilerplate types (new Abp.Application.Services.Dto.NameValueDto()): the namespace does not exist in
+    /// ABP.io, so the simple name is kept and mapped like any other (NameValueDto → NameValue + using Volo.Abp).
+    /// </summary>
+    public override SyntaxNode? VisitQualifiedName(QualifiedNameSyntax node)
+    {
+        // Not the name of a using or of a namespace declaration ("namespace Abp.Foo"), only names used as types.
+        if (node.Parent is QualifiedNameSyntax || node.Ancestors().Any(a => a is UsingDirectiveSyntax) ||
+            node.AncestorsAndSelf().Any(a => a.Parent is BaseNamespaceDeclarationSyntax ns && ns.Name == a) ||
+            node.DescendantNodesAndSelf().OfType<IdentifierNameSyntax>().FirstOrDefault()?.Identifier.Text != "Abp")
+        {
+            return base.VisitQualifiedName(node);
+        }
+
+        Context.Change($"{node} → {node.Right}");
+        // The namespace's ABP.io counterpart (Abp.Application.Services.Dto → Volo.Abp.Application.Dtos) for the simple name.
+        if (NamespaceMappings.Map.TryGetValue(node.Left.ToString(), out var namespaces))
+        {
+            foreach (var ns in namespaces) Context.RequireUsing(ns);
+        }
+
+        var simple = node.Right.WithTriviaFrom(node);
+        return simple switch
+        {
+            GenericNameSyntax generic => VisitGenericName(generic),
+            IdentifierNameSyntax identifier => VisitIdentifierName(identifier),
+            _ => simple
+        };
+    }
+
     public override SyntaxNode? VisitGenericName(GenericNameSyntax node)
     {
         var visited = (GenericNameSyntax)base.VisitGenericName(node)!;
@@ -202,6 +232,16 @@ public sealed class TypeNameRewriter : MigrationRewriter
     public override SyntaxNode? VisitParameter(ParameterSyntax node)
     {
         var visited = (ParameterSyntax)base.VisitParameter(node)!;
+
+        // ctor(Castle.Core.Logging.ILogger logger): Microsoft's non-generic ILogger is not a service → ILogger<ThisClass>
+        // (an ILogger too, so the field it is stored in does not change).
+        if (visited.Type is IdentifierNameSyntax { Identifier.Text: "ILogger" } logger && node.Parent?.Parent is ConstructorDeclarationSyntax ctor &&
+            node.Ancestors().OfType<CompilationUnitSyntax>().FirstOrDefault()?.Usings.Any(u => u.Name?.ToString() == "Castle.Core.Logging") == true)
+        {
+            Context.Change($"constructor ILogger (Castle) → ILogger<{ctor.Identifier.Text}>");
+            return visited.WithType(ParseTypeName($"ILogger<{ctor.Identifier.Text}>").WithTriviaFrom(logger));
+        }
+
         return visited.Type is not null && GuidId(visited.Identifier.Text, visited.Type) is { } guid ? visited.WithType(guid) : visited;
     }
 

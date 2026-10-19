@@ -119,7 +119,7 @@ public static class ZeroMappings
     {
         "UserLoginAttempt", "UserLoginAttemptResult", "Edition", "AbpEditionManager",
         "IdentityRegistrar", "AbpUserConfigurationBuilder", "AbpZeroDbMigrator", "IAbpZeroDbMigrator", "AbpCommonHub",
-        "IOnlineClientManager", "OnlineClientManager", "DefaultEditionCreator", "AbpZeroTemplateConsts", "AbpZeroDbContext",
+        "DefaultEditionCreator", "AbpZeroTemplateConsts", "AbpZeroDbContext",
         "IAbpZeroConfig", "AbpZeroSettingNames", "ImpersonationManager", "IUserTokenExpirationValidator"
     };
 

@@ -27,6 +27,11 @@ public static class TypeMappings
         ["AbpMvcAuthorizeAttribute"] = new("AuthorizeAttribute", "Microsoft.AspNetCore.Authorization"),
         ["ILocalizationManager"] = new("IStringLocalizerFactory", "Microsoft.Extensions.Localization"),
         ["NameValueDto"] = new("NameValue", "Volo.Abp"),
+        // Abp.EntityHistory.EntityChangeType: same values (Created 0, Updated 1, Deleted 2).
+        ["EntityChangeType"] = new("EntityChangeType", "Volo.Abp.Auditing"),
+        // Boilerplate's ICurrentUnitOfWorkProvider.Current → IUnitOfWorkManager.Current (the same IUnitOfWork members used).
+        ["ICurrentUnitOfWorkProvider"] = new("IUnitOfWorkManager", "Volo.Abp.Uow"),
+        ["IAbpAntiForgeryManager"] = new("IAbpAntiForgeryManager", "Volo.Abp.AspNetCore.Mvc.AntiForgery"),
         ["AbpAuthorizeAttribute"] = new("AuthorizeAttribute", "Microsoft.AspNetCore.Authorization"),
         ["IAbpAuthorizeAttribute"] = new("IAuthorizeData", "Microsoft.AspNetCore.Authorization"),
         ["IAudited"] = new("IAuditedObject", "Volo.Abp.Auditing"),

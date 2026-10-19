@@ -58,6 +58,7 @@ public static class NamespaceMappings
         ["Abp.Configuration.Startup"] = [],
         ["Abp.MultiTenancy"] = ["Volo.Abp.MultiTenancy"],
         ["Abp.Auditing"] = ["Volo.Abp.Auditing"],
+        ["Abp.EntityHistory"] = ["Volo.Abp.Auditing"],
         ["Abp.BackgroundJobs"] = ["Volo.Abp.BackgroundJobs"],
         ["Abp.Threading.BackgroundWorkers"] = ["Volo.Abp.BackgroundWorkers"],
         ["Abp.Net.Mail"] = ["Volo.Abp.Emailing"],
@@ -83,6 +84,9 @@ public static class NamespaceMappings
 
         ["Abp.AspNetCore"] = ["Volo.Abp.AspNetCore"],
         ["Abp.AspNetCore.Mvc.Controllers"] = ["Volo.Abp.AspNetCore.Mvc"],
+        // ActionDescriptor.IsControllerAction() / GetMethodInfo(), ActionResultHelper: same names in Volo.Abp.AspNetCore.Mvc.
+        ["Abp.AspNetCore.Mvc.Extensions"] = ["Volo.Abp.AspNetCore.Mvc", "Microsoft.AspNetCore.Mvc.Abstractions"],
+        ["Abp.AspNetCore.Mvc.Results"] = ["Volo.Abp.AspNetCore.Mvc"],
         ["Abp.AspNetCore.Mvc.Authorization"] = ["Microsoft.AspNetCore.Authorization"],
         ["Abp.AspNetCore.Mvc.Antiforgery"] = ["Volo.Abp.AspNetCore.Mvc.AntiForgery"],
         ["Abp.AspNetCore.Configuration"] = ["Volo.Abp.AspNetCore.Mvc"],

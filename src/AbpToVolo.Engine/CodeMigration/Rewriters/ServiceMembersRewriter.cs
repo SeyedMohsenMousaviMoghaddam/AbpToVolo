@@ -279,7 +279,8 @@ public sealed class ServiceMembersRewriter : MigrationRewriter
         }
 
         // CurrentUnitOfWork.DisableFilter(AbpDataFilters.SoftDelete) → DataFilter.Disable<ISoftDelete>()
-        if (method is "DisableFilter" or "EnableFilter" && receiver is "CurrentUnitOfWork" or "UnitOfWorkManager.Current" or "_unitOfWorkManager.Current")
+        if (method is "DisableFilter" or "EnableFilter" && (receiver is "CurrentUnitOfWork" or "UnitOfWorkManager.Current" or "_unitOfWorkManager.Current" ||
+                                                           receiver.Contains("uow", StringComparison.OrdinalIgnoreCase) || receiver.EndsWith("UnitOfWork", StringComparison.OrdinalIgnoreCase)))
         {
             // Several filters that are one in ABP.io (MayHaveTenant + MustHaveTenant → IMultiTenant) become one Disable call.
             var interfaces = visited.ArgumentList.Arguments.Select(a => DataFilters.GetValueOrDefault(a.Expression.ToString().Split('.').Last())).Distinct().ToList();
@@ -320,7 +321,11 @@ public sealed class ServiceMembersRewriter : MigrationRewriter
 
             Context.Change($"EventBus.{method} → PublishAsync");
             var newReceiver = receiver == "EventBus" ? IdentifierName("LocalEventBus") : access.Expression;
-            return visited.WithExpression(access.WithExpression(newReceiver).WithName(IdentifierName("PublishAsync")));
+            var published = visited.WithExpression(access.WithExpression(newReceiver).WithName(IdentifierName("PublishAsync")));
+            // TriggerAsync(this, eventData): Boilerplate's first argument is the sender; PublishAsync only takes the event.
+            return visited.ArgumentList.Arguments is [{ Expression: ThisExpressionSyntax }, var eventData]
+                ? published.WithArgumentList(visited.ArgumentList.WithArguments(SingletonSeparatedList(eventData.WithoutLeadingTrivia())))
+                : published;
         }
 
         return visited;

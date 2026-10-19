@@ -1,6 +1,8 @@
 using System.Text.RegularExpressions;
 using AbpToVolo.CodeMigration;
 using AbpToVolo.Core;
+using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
 
 namespace AbpToVolo.Steps;
 
@@ -14,7 +16,7 @@ namespace AbpToVolo.Steps;
 ///   - [DontWrapResult] / [WrapResult] keep working (compatibility attributes in Domain.Shared).
 /// The ABP.io module endpoints (/api/abp/..., /api/identity/..., /connect/token) are not changed.
 /// </summary>
-public sealed class BoilerplateApiStep : IMigrationStep
+public sealed partial class BoilerplateApiStep : IMigrationStep
 {
     public string Name => "Boilerplate HTTP API compatibility";
 
@@ -50,6 +52,7 @@ public sealed class BoilerplateApiStep : IMigrationStep
         var wired = Wire(context, httpApi, ProjectLayer.HttpApi, $"global::{ns}.BoilerplateApi.ConfigureServices(context.Services);");
         AddTenantIdResolver(context, ns);
         AddJwtBearer(context, ns, sources);
+        AddMvcFilters(context);
 
         context.Report.Change(Name, "Application services keep the Boilerplate routes /api/services/app/{Service}/{Action}; results, errors and 401/403 " +
                                     "answers keep the AjaxResponse envelope ([DontWrapResult] respected)", context.Relative(mvc));
@@ -61,6 +64,44 @@ public sealed class BoilerplateApiStep : IMigrationStep
         context.Report.Info(Name, "To move to the ABP.io API (/api/app/..., results not wrapped) later: convert with --api-style abp, or remove " +
                                   "BoilerplateApi.ConfigureServices and BoilerplateConventionalRouteBuilder, then update the front end.");
     }
+
+    /// <summary>
+    /// MVC filters of the solution the Boilerplate Startup registered (options.Filters.AddService(typeof(ClientInfoFilter))
+    /// in AddControllersWithViews / AddMvc): the Startup is not used any more, so the module of the project that declares
+    /// the filter registers it (an authorization filter of the application keeps checking its permissions).
+    /// </summary>
+    private void AddMvcFilters(MigrationContext context)
+    {
+        var all = context.Projects.Where(p => p.Layer != ProjectLayer.Tests)
+            .SelectMany(p => FileSystem.EnumerateFiles(p.Directory, "*.cs").Select(f => (Project: p, File: f))).ToList();
+        // The Startup that registered them is in the legacy folder now (not enumerated with the code).
+        static bool BuildOutput(string f) => f.Contains($"{Path.DirectorySeparatorChar}bin{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase) ||
+                                             f.Contains($"{Path.DirectorySeparatorChar}obj{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase);
+        var registered = context.Projects.Where(p => p.Layer != ProjectLayer.Tests)
+            .SelectMany(p => Directory.EnumerateFiles(p.Directory, "*.cs", SearchOption.AllDirectories)).Where(f => !BuildOutput(f))
+            .Select(File.ReadAllText)
+            .SelectMany(text => MvcFilterRegistration().Matches(text).Select(m => m.Groups["type"].Value))
+            .Where(t => !t.StartsWith("Abp", StringComparison.Ordinal))
+            .ToHashSet(StringComparer.Ordinal);
+        foreach (var type in registered)
+        {
+            // The declaration (outside the legacy folder): its project and namespace.
+            var declaration = all.Where(x => !context.IsExcluded(x.File))
+                .Select(x => (x.Project, Root: CSharpSyntaxTree.ParseText(File.ReadAllText(x.File)).GetCompilationUnitRoot()))
+                .Select(x => (x.Project, Class: x.Root.DescendantNodes().OfType<ClassDeclarationSyntax>().FirstOrDefault(c => c.Identifier.Text == type)))
+                .FirstOrDefault(x => x.Class is not null);
+            if (declaration.Class is null) continue;
+            var typeNs = declaration.Class.Ancestors().OfType<BaseNamespaceDeclarationSyntax>().FirstOrDefault()?.Name.ToString();
+            var fullName = typeNs is null ? $"global::{type}" : $"global::{typeNs}.{type}";
+            var wired = Wire(context, declaration.Project, declaration.Project.Layer,
+                $"context.Services.Configure<global::Microsoft.AspNetCore.Mvc.MvcOptions>(options => options.Filters.AddService(typeof({fullName})));");
+            context.Report.Change(Name, $"MVC filter {type} registered as the Boilerplate Startup did", context.Relative(declaration.Project.CsprojPath));
+            if (!wired) context.Report.Todo(Name, $"Register the MVC filter {type} (options.Filters.AddService) in the module of {declaration.Project.Name}.", context.Relative(declaration.Project.CsprojPath));
+        }
+    }
+
+    [GeneratedRegex(@"Filters\.(?:AddService|Add)\s*(?:\(\s*typeof\s*\(\s*(?<type>\w+)\s*\)|<\s*(?<type>\w+)\s*>)")]
+    private static partial Regex MvcFilterRegistration();
 
     /// <summary>
     /// Boilerplate clients select the tenant with the "Abp.TenantId" header/cookie (the int id of the source). With

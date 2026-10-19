@@ -203,7 +203,10 @@ public sealed class ModuleZeroStep : IMigrationStep
             {
                 if (member is not ConstructorDeclarationSyntax ctor) return member;
                 var passed = ctor.Initializer?.ArgumentList.Arguments.Select(a => a.Expression.ToString()).ToHashSet(StringComparer.Ordinal) ?? [];
-                var own = ctor.ParameterList.Parameters.Where(p => !passed.Contains(p.Identifier.Text));
+                // A parameter passed to the Zero base that the constructor also keeps (_settingManager = settingManager) stays.
+                var usedInBody = ((SyntaxNode?)ctor.Body ?? ctor.ExpressionBody)?.DescendantNodes().OfType<IdentifierNameSyntax>()
+                    .Select(i => i.Identifier.Text).ToHashSet(StringComparer.Ordinal) ?? [];
+                var own = ctor.ParameterList.Parameters.Where(p => !passed.Contains(p.Identifier.Text) || usedInBody.Contains(p.Identifier.Text));
                 return ctor.WithParameterList(ctor.ParameterList.WithParameters(SeparatedList(own)))
                     .WithInitializer(ConstructorInitializer(SyntaxKind.BaseConstructorInitializer, ArgumentList())
                         .WithColonToken(Token(SyntaxKind.ColonToken).WithLeadingTrivia(Space).WithTrailingTrivia(Space)))
@@ -430,7 +433,7 @@ public sealed class ModuleZeroStep : IMigrationStep
     private static readonly HashSet<string> SurgicalTriggers = new(StringComparer.Ordinal)
     {
         "INotificationPublisher", "IRealTimeNotifier", "IUserNotificationManager", "INotificationSubscriptionManager", "INotificationStore",
-        "IOnlineClientManager", "NotificationData", "LocalizableMessageNotificationData", "MessageNotificationData", "UserNotification",
+        "NotificationData", "LocalizableMessageNotificationData", "MessageNotificationData", "UserNotification",
         "TenantNotification", "UserNotificationInfo", "NotificationDefinition", "INotificationDefinitionManager"
     };
 

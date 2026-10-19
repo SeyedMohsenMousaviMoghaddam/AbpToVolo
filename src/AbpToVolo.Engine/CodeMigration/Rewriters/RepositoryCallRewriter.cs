@@ -48,9 +48,10 @@ public sealed class RepositoryCallRewriter : MigrationRewriter
         if (visited.Expression is InvocationExpressionSyntax
             {
                 Expression: MemberAccessExpressionSyntax { Name.Identifier.Text: "InsertAndGetIdAsync" } access
-            } invocation && IsRepository(access.Expression))
+            } invocation)
         {
             // await repo.InsertAndGetIdAsync(e)  →  (await repo.InsertAsync(e, autoSave: true)).Id
+            // (only Boilerplate repositories have InsertAndGetIdAsync, whatever the field is called: _peopleRepo, _peopleReop…)
             Context.Change("InsertAndGetIdAsync(e) → (await InsertAsync(e, autoSave: true)).Id");
             var arguments = ParseArgumentList(
                 "(" + string.Join(", ", invocation.ArgumentList.Arguments.Select(a => a.ToString()).Append("autoSave: true")) + ")");

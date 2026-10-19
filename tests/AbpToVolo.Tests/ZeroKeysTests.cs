@@ -182,9 +182,10 @@ public sealed class ZeroKeysTests : RewriterTestBase
         var (code, _) = Migrate(source);
 
         Assert.DoesNotContain("IActiveTransactionProvider", code);
-        AssertContains("(await GetDbContextAsync()).Database.CurrentTransaction?.GetDbTransaction()", code);
+        // The connection is opened as with Boilerplate's provider (ABP.io starts no transaction for GET requests).
+        AssertContains("(await (await GetDbContextAsync()).GetActiveTransactionCompatAsync())", code);
         AssertContains(": base(dbContextProvider)", code);
-        AssertContains("using Microsoft.EntityFrameworkCore.Storage;", code);
+        AssertContains("using Microsoft.EntityFrameworkCore;", code);
     }
 
     [Fact]
@@ -339,6 +340,23 @@ public sealed class ZeroKeysTests : RewriterTestBase
         var edit = edits.Values.SelectMany(e => e).SingleOrDefault();
         Assert.Equal(replaced, edit.Key?.ToString());
         Assert.Equal(expected, edit.Value?.ToString());
+    }
+
+    [Theory]
+    [InlineData("new IdentityUser() { UserName = n, Email = e, IsActive = true, Name = f, TenantId = t, PeopleId = p }", "IdentityUser",
+        "new IdentityUser(GuidGenerator.Create(), (n) ?? string.Empty, (e) ?? string.Empty, t) { Name = f }.SetProtected(e => e.IsActive, true).SetProperty(\"PeopleId\", p)")]
+    [InlineData("new IdentityRole { Name = n, DisplayName = d, TenantId = t, IsStatic = true }", "IdentityRole",
+        "new IdentityRole(GuidGenerator.Create(), (n) ?? string.Empty, t) { IsStatic = true }.SetProperty(\"DisplayName\", d)")]
+    [InlineData("new IdentityRole()", "IdentityRole", "new IdentityRole(GuidGenerator.Create(), (null) ?? string.Empty, null)")]
+    [InlineData("new Tenant { Name = n }", "Tenant",
+        "ModuleEntityFactory.NewTenant(GuidGenerator.Create()).SetProtected(e => e.Name, n).SetProtected(e => e.NormalizedName, (n)?.ToUpperInvariant())")]
+    [InlineData("new IdentityUser { UserName = n, Roles = new List<IdentityUserRole>() }", "IdentityUser",
+        "new IdentityUser(GuidGenerator.Create(), (n) ?? string.Empty, (null) ?? string.Empty, null)")]
+    public void Module_entities_are_created_with_their_abp_constructor(string creation, string type, string expected)
+    {
+        var node = (Microsoft.CodeAnalysis.CSharp.Syntax.ObjectCreationExpressionSyntax)SyntaxFactory.ParseExpression(creation);
+
+        Assert.Equal(expected, BuildFixStep.RewriteModuleEntityCreation(node, type).ToString());
     }
 
     [Theory]

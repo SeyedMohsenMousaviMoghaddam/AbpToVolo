@@ -38,7 +38,7 @@ public sealed partial class BuildFixStep
         if (!context.UsesIdentityModules) return 0;
         var legacyIds = context.Options.IdType == IdTypeMode.Source;
         var applied = 0;
-        var relevant = errors.Where(e => legacyIds && (TypeMismatchCodes.Contains(e.Code) || e.Code == "CS1941") ||
+        var relevant = errors.Where(e => legacyIds && (TypeMismatchCodes.Contains(e.Code) || e.Code is "CS1941" or "CS1660") ||
                                          e.Code == "CS1061" && MissingMember().Match(e.Message) is { Success: true } m &&
                                          IsZeroMember(context, m.Groups["type"].Value, m.Groups["member"].Value) ||
                                          e.Code is "CS7036" or "CS1729" or "CS1995");
@@ -83,10 +83,12 @@ public sealed partial class BuildFixStep
                 if (error.Code == "CS1929")
                 {
                     PlanLegacyIdCollection(semantic, node, error, edits);
+                    PlanLegacyIdSetOperation(model, node, error, edits);
                     continue;
                 }
 
-                if (error.Code == "CS1941")
+                // CS1660 too: a join with "into" whose keys differ is reported as "cannot convert query expression".
+                if (error.Code is "CS1941" or "CS1660")
                 {
                     PlanLegacyIdJoin(model, node, edits);
                     continue;
@@ -164,7 +166,8 @@ public sealed partial class BuildFixStep
         var key = Members(target).OfType<IPropertySymbol>().FirstOrDefault(p => p.Name == "Id")?.Type.ToDisplayString();
         var method = access.Ancestors().FirstOrDefault(a => a is BaseMethodDeclarationSyntax or LocalFunctionStatementSyntax or AccessorDeclarationSyntax);
         var body = method switch { BaseMethodDeclarationSyntax m => m.Body, LocalFunctionStatementSyntax f => f.Body, AccessorDeclarationSyntax a => a.Body, _ => null };
-        if (key is null || body is null || model.LookupSymbols(access.SpanStart, name: "LazyServiceProvider").IsEmpty) return;
+        // LazyServiceProvider: inherited (ApplicationService, DomainService…) or declared by the next round (property injection).
+        if (key is null || body is null) return;
 
         var isAsync = method switch { BaseMethodDeclarationSyntax m => m.Modifiers.Any(SyntaxKind.AsyncKeyword), LocalFunctionStatementSyntax f => f.Modifiers.Any(SyntaxKind.AsyncKeyword), _ => false };
         var repository = $"LazyServiceProvider.LazyGetRequiredService<global::Volo.Abp.Domain.Repositories.IRepository<global::{navigation.TargetType}, {key}>>()";
@@ -289,12 +292,38 @@ public sealed partial class BuildFixStep
     private static void PlanTenantIdConversion(SemanticProject semantic, SemanticModel model, SyntaxNode node, ExpressionSyntax expression, BuildDiagnostic error,
         Dictionary<SyntaxTree, Dictionary<SyntaxNode, SyntaxNode>> edits)
     {
-        static bool IsGuid(string type) => type.TrimEnd('?') is "System.Guid" or "Guid";
+        // Also the property selector overload the compiler picks when the value does not match:
+        // setters.SetProperty(p => p.LastModifierId, legacyUserId) → "to 'Expression<Func<T, Guid?>>'".
+        static bool IsGuid(string type) => type.TrimEnd('?') is "System.Guid" or "Guid" ||
+                                           type.StartsWith("System.Linq.Expressions.Expression<System.Func<", StringComparison.Ordinal) &&
+                                           (type.EndsWith(", System.Guid?>>", StringComparison.Ordinal) || type.EndsWith(", System.Guid>>", StringComparison.Ordinal));
         static string? Legacy(string type) => type.TrimEnd('?') switch { "int" or "System.Int32" => "tenant", "long" or "System.Int64" => "user", _ => null };
 
         ExpressionSyntax? target = null;
         string? kind = null;
         var toGuid = false;
+        if (ConversionMessage().Match(error.Message) is { Success: true } arrays && arrays.Groups["from"].Value is "System.Guid[]" &&
+            arrays.Groups["to"].Value is "int[]" or "long[]" && error.Code == "CS0029")
+        {
+            // dto.RoleIds (int[]) = await query.Select(x => x.RoleId).ToArrayAsync() (Guid[]): the ids are converted on the client.
+            var assigned = (node.AncestorsAndSelf().OfType<AssignmentExpressionSyntax>().FirstOrDefault()?.Left.ToString() ?? "") + expression;
+            var arrayKind = arrays.Groups["to"].Value == "long[]" ? "user"
+                : assigned.Contains("role", StringComparison.OrdinalIgnoreCase) ? "role"
+                : assigned.Contains("tenant", StringComparison.OrdinalIgnoreCase) ? "tenant" : null;
+            var (arrayHelper, arrayMethod) = arrayKind switch
+            {
+                "user" => ("LegacyUserIds", "ToLegacyUserId"), "role" => ("LegacyRoleIds", "ToLegacyRoleId"), "tenant" => ("LegacyTenantIds", "ToLegacyTenantId"), _ => ("", "")
+            };
+            if (arrayKind is not null && FindType(semantic.Compilation, arrayHelper) is { } arrayType)
+            {
+                Add(edits, expression, ParseExpression(
+                        $"{Parenthesize(expression.WithoutTrivia())}.Select(__id => global::{arrayType.ToDisplayString()}.{arrayMethod}(__id)).ToArray()")
+                    .WithTriviaFrom(expression));
+            }
+
+            return;
+        }
+
         if (ConversionMessage().Match(error.Message) is { Success: true } conversion)
         {
             var (from, to) = (conversion.Groups["from"].Value, conversion.Groups["to"].Value);
@@ -307,8 +336,22 @@ public sealed partial class BuildFixStep
         {
             // Compare as Guid: the source-typed side (a DTO / parameter value) is converted.
             var (a, b) = (op.Groups["a"].Value, op.Groups["b"].Value);
-            if (IsGuid(a) && Legacy(b) is { } right) (target, kind, toGuid) = (binary.Right, right, true);
+            // …except an audit user id (entity.CreatorId was CreatorUserId, compared with a source id): the audit side
+            // becomes the user's source id, as in the source (in memory only: in an EF Core query the other side is converted).
+            static bool Audit(ExpressionSyntax e) => e is MemberAccessExpressionSyntax { Name.Identifier.Text: "CreatorId" or "LastModifierId" or "DeleterId" };
+            var inQuery = InExpressionTree(model, binary);
+            if (!inQuery && IsGuid(a) && Legacy(b) is not null && Audit(binary.Left)) (target, kind) = (binary.Left, "user");
+            else if (!inQuery && Legacy(a) is not null && IsGuid(b) && Audit(binary.Right)) (target, kind) = (binary.Right, "user");
+            else if (IsGuid(a) && Legacy(b) is { } right) (target, kind, toGuid) = (binary.Right, right, true);
             else if (Legacy(a) is { } left && IsGuid(b)) (target, kind, toGuid) = (binary.Left, left, true);
+        }
+        else if (error.Code == "CS0173" && ConditionalMessage().Match(error.Message) is { Success: true } conditional &&
+                 node.AncestorsAndSelf().OfType<ConditionalExpressionSyntax>().FirstOrDefault() is { } ternary)
+        {
+            // c ? CurrentTenant.Id : input.TenantId — the source-typed branch is converted to the ABP.io id.
+            var (a, b) = (conditional.Groups["a"].Value, conditional.Groups["b"].Value);
+            if (IsGuid(a) && Legacy(b) is { } whenFalse) (target, kind, toGuid) = (ternary.WhenFalse, whenFalse, true);
+            else if (Legacy(a) is { } whenTrue && IsGuid(b)) (target, kind, toGuid) = (ternary.WhenTrue, whenTrue, true);
         }
 
         if (target is null || kind is null) return;
@@ -327,6 +370,8 @@ public sealed partial class BuildFixStep
             if (own.Contains("role", StringComparison.OrdinalIgnoreCase) && !own.Contains("tenant", StringComparison.OrdinalIgnoreCase)) kind = "role";
             else if (own.Contains("tenant", StringComparison.OrdinalIgnoreCase) || about.Contains("tenant", StringComparison.OrdinalIgnoreCase)) kind = "tenant";
             else if (about.Contains("role", StringComparison.OrdinalIgnoreCase)) kind = "role";
+            // An int DTO id compared with a user id (x.UserId == input.Id): the user's source id (int widens to long).
+            else if (about.Contains("user", StringComparison.OrdinalIgnoreCase)) kind = "user";
             else return;
         }
 
@@ -354,6 +399,15 @@ public sealed partial class BuildFixStep
             return;
         }
 
+        // The current user's source id where the ABP.io id is wanted: CurrentUser.Id itself.
+        if (toGuid && kind == "user" && target.WithoutTrivia().ToString() is "CurrentUser.GetLegacyId()" or "CurrentUser.GetLegacyId().Value")
+        {
+            // long? → Guid? (CurrentUser.Id); .Value (long) → Guid (CurrentUser.GetId()).
+            var current = target.ToString().EndsWith(".Value", StringComparison.Ordinal) ? "CurrentUser.GetId()" : "CurrentUser.Id";
+            Add(edits, target, ParseExpression(current).WithTriviaFrom(target));
+            return;
+        }
+
         Add(edits, target, ParseExpression($"global::{helper.ToDisplayString()}.{method}({target.WithoutTrivia()})").WithTriviaFrom(target));
     }
 
@@ -364,6 +418,21 @@ public sealed partial class BuildFixStep
     internal static void PlanLegacyIdJoin(SemanticModel model, SyntaxNode node, Dictionary<SyntaxTree, Dictionary<SyntaxNode, SyntaxNode>> edits)
     {
         if (node.AncestorsAndSelf().OfType<JoinClauseSyntax>().FirstOrDefault() is not { } join) return;
+
+        // join k in userRoles on p.RoleId equals k.RoleId: the source id of a permission setting (read model) against an
+        // ABP.io Guid → the setting's RoleKey / UserKey (the same user/role, as its ABP.io id).
+        foreach (var (key, other) in new[] { (join.LeftExpression, join.RightExpression), (join.RightExpression, join.LeftExpression) })
+        {
+            if (key is MemberAccessExpressionSyntax { Name.Identifier.Text: "RoleId" or "UserId" } setting &&
+                model.GetTypeInfo(setting.Expression).Type?.Name is "RolePermissionSetting" or "UserPermissionSetting" &&
+                model.GetTypeInfo(other).Type?.ToDisplayString().TrimEnd('?') is "System.Guid")
+            {
+                var keyName = setting.Name.Identifier.Text == "RoleId" ? "RoleKey" : "UserKey";
+                Add(edits, setting, setting.WithName(IdentifierName(keyName).WithTriviaFrom(setting.Name)));
+                return;
+            }
+        }
+
         if (ElementType(model.GetTypeInfo(join.InExpression).Type) is not { } element ||
             element.ToDisplayString() is not (IdentityUserType or IdentityRoleType or TenantType))
         {
@@ -390,6 +459,70 @@ public sealed partial class BuildFixStep
     };
 
     /// <summary>
+    /// CS1929 — a.Union(b) where a projects source ids (new { UserId = coc.UserId }: long) and b the ABP.io id of a user
+    /// (new { UserId = u.Id }: Guid): in b's query the module entity's Id becomes its source id, EF.Property&lt;long&gt;(u, "LegacyId").
+    /// </summary>
+    private static void PlanLegacyIdSetOperation(SemanticModel model, SyntaxNode node, BuildDiagnostic error,
+        Dictionary<SyntaxTree, Dictionary<SyntaxNode, SyntaxNode>> edits)
+    {
+        if (!System.Text.RegularExpressions.Regex.IsMatch(error.Message, @"does not contain a definition for '(Union|Concat|Except|Intersect)'") ||
+            node.AncestorsAndSelf().OfType<InvocationExpressionSyntax>().FirstOrDefault(i => i.Expression is MemberAccessExpressionSyntax
+                { Name.Identifier.Text: "Union" or "Concat" or "Except" or "Intersect" }) is not { ArgumentList.Arguments: [var argument] })
+        {
+            return;
+        }
+
+        // The other query: the argument itself, or the initializer of the local it names.
+        SyntaxNode? query = argument.Expression;
+        if (argument.Expression is IdentifierNameSyntax local && model.GetSymbolInfo(local).Symbol is ILocalSymbol symbol &&
+            symbol.DeclaringSyntaxReferences.FirstOrDefault()?.GetSyntax() is VariableDeclaratorSyntax { Initializer.Value: var initializer })
+        {
+            query = initializer;
+        }
+
+        // Also the query of the receiver (the statement that declares or assigns it), when the ABP.io ids are on that side.
+        var queries = new List<SyntaxNode> { query };
+        if (node.AncestorsAndSelf().OfType<InvocationExpressionSyntax>().FirstOrDefault()?.Expression is MemberAccessExpressionSyntax { Expression: IdentifierNameSyntax receiver } &&
+            model.GetSymbolInfo(receiver).Symbol is ILocalSymbol receiverSymbol &&
+            receiverSymbol.DeclaringSyntaxReferences.FirstOrDefault()?.GetSyntax() is VariableDeclaratorSyntax { Initializer.Value: var receiverQuery })
+        {
+            queries.Add(receiverQuery);
+        }
+
+        foreach (var declarator in queries.SelectMany(q => q.DescendantNodesAndSelf().OfType<AnonymousObjectMemberDeclaratorSyntax>()))
+        {
+            if (declarator.Expression is not MemberAccessExpressionSyntax { Name.Identifier.Text: var memberName, Expression: var owner } access ||
+                model.GetTypeInfo(owner).Type?.ToDisplayString() is not { } ownerType)
+            {
+                continue;
+            }
+
+            ExpressionSyntax? replacement = null;
+            if (memberName == "Id" && ownerType switch { IdentityUserType => "long", IdentityRoleType or TenantType => "int", _ => null } is { } legacyType)
+            {
+                replacement = ParseExpression($"EF.Property<{legacyType}>({owner.WithoutTrivia()}, \"{LegacyIdProperty}\")");
+            }
+            else if (memberName is "UserId" or "RoleId" && model.GetTypeInfo(access).Type?.ToDisplayString().TrimEnd('?') == "System.Guid" &&
+                     declarator.Ancestors().OfType<QueryExpressionSyntax>().FirstOrDefault() is { } queryExpression)
+            {
+                // k.UserId (Guid foreign key) where the query joins "on k.UserId equals u.Id": the joined user's source id.
+                var target = memberName == "UserId" ? (Type: IdentityUserType, Legacy: "long") : (Type: IdentityRoleType, Legacy: "int");
+                var joined = queryExpression.DescendantNodes().OfType<JoinClauseSyntax>().FirstOrDefault(j =>
+                    (j.LeftExpression.ToString() == access.ToString() && j.RightExpression is MemberAccessExpressionSyntax { Name.Identifier.Text: "Id" } r &&
+                     r.Expression.ToString() == j.Identifier.Text ||
+                     j.RightExpression.ToString() == access.ToString() && j.LeftExpression is MemberAccessExpressionSyntax { Name.Identifier.Text: "Id" } l &&
+                     l.Expression.ToString() == j.Identifier.Text) &&
+                    ElementType(model.GetTypeInfo(j.InExpression).Type)?.ToDisplayString() == target.Type);
+                if (joined is not null) replacement = ParseExpression($"EF.Property<{target.Legacy}>({joined.Identifier.Text}, \"{LegacyIdProperty}\")");
+            }
+
+            if (replacement is null) continue;
+            if (declarator.NameEquals is null) Add(edits, declarator, SyntaxHelpers.NamedMember(declarator, memberName, replacement));
+            else Add(edits, access, replacement.WithTriviaFrom(access));
+        }
+    }
+
+    /// <summary>
     /// ids.Contains(x.UserId) with source ids (long[] / List&lt;int&gt;… from a DTO) and an ABP.io Guid: the collection is converted
     /// (ids.Select(__id => LegacyUserIds.ToUserGuid(__id)).ToArray()) — evaluated on the client, a parameter of the query.
     /// </summary>
@@ -405,11 +538,66 @@ public sealed partial class BuildFixStep
 
         var element = match.Groups["element"].Value.TrimEnd('?');
         var argument = invocation.ArgumentList.Arguments.FirstOrDefault()?.Expression.ToString() ?? "";
+
+        // ABP.io ids (Guid) in the collection, a source id as the argument.
+        if (element is "Guid" or "System.Guid")
+        {
+            // a) The collection is a conversion of an earlier round (the argument was a Guid then): back to the source ids.
+            if (contains.Expression is InvocationExpressionSyntax { Expression: MemberAccessExpressionSyntax { Name.Identifier.Text: "ToArray", Expression: InvocationExpressionSyntax
+                {
+                    Expression: MemberAccessExpressionSyntax { Name.Identifier.Text: "Select", Expression: var original },
+                    ArgumentList.Arguments: [{ Expression: SimpleLambdaExpressionSyntax { Body: InvocationExpressionSyntax converter } }]
+                } } } && converter.Expression.ToString().Contains("Legacy", StringComparison.Ordinal))
+            {
+                Add(edits, contains.Expression, original.WithTriviaFrom(contains.Expression));
+                return;
+            }
+
+            // b) items.Select(x => x.Id) over users / roles / tenants: their source ids.
+            if (contains.Expression.DescendantNodesAndSelf().OfType<InvocationExpressionSyntax>().FirstOrDefault(i =>
+                    i.Expression is MemberAccessExpressionSyntax { Name.Identifier.Text: "Select" } &&
+                    i.ArgumentList.Arguments is [{ Expression: SimpleLambdaExpressionSyntax { Body: MemberAccessExpressionSyntax { Name.Identifier.Text: "Id" } } }])
+                is { } select && select.ArgumentList.Arguments[0].Expression is SimpleLambdaExpressionSyntax { Body: MemberAccessExpressionSyntax body } lambda)
+            {
+                var model = semantic.Compilation.GetSemanticModel(select.SyntaxTree);
+                var itemType = model.GetTypeInfo(body.Expression).Type;
+                var legacyType = itemType?.ToDisplayString() switch
+                {
+                    IdentityUserType => "long", IdentityRoleType or TenantType => "int", _ => null
+                };
+                if (legacyType is not null)
+                {
+                    Add(edits, body, ParseExpression($"EF.Property<{legacyType}>({lambda.Parameter.Identifier.Text}, \"{LegacyIdProperty}\")").WithTriviaFrom(body));
+                }
+                else if (itemType is { IsAnonymousType: true } && select.Ancestors().FirstOrDefault(a => a is BaseMethodDeclarationSyntax) is { } enclosingMethod)
+                {
+                    // x is an anonymous projection (select new { …, k.Id }) of the method: its Id comes from a user / role / tenant —
+                    // the source id there, as in the source (the argument's type tells which: long users, int roles / tenants).
+                    var argumentType = model.GetTypeInfo(invocation.ArgumentList.Arguments[0].Expression).Type?.ToDisplayString().TrimEnd('?');
+                    var wanted = argumentType switch { "long" => new[] { IdentityUserType }, "int" => [IdentityRoleType, TenantType], _ => [] };
+                    foreach (var declarator in enclosingMethod.DescendantNodes().OfType<AnonymousObjectMemberDeclaratorSyntax>())
+                    {
+                        if ((declarator.NameEquals?.Name.Identifier.Text ?? (declarator.Expression as MemberAccessExpressionSyntax)?.Name.Identifier.Text) != body.Name.Identifier.Text ||
+                            declarator.Expression is not MemberAccessExpressionSyntax { Name.Identifier.Text: "Id", Expression: var owner } ||
+                            !wanted.Contains(model.GetTypeInfo(owner).Type?.ToDisplayString()))
+                        {
+                            continue;
+                        }
+
+                        var legacy = argumentType == "long" ? "long" : "int";
+                        var value = ParseExpression($"EF.Property<{legacy}>({owner.WithoutTrivia()}, \"{LegacyIdProperty}\")");
+                        Add(edits, declarator, declarator.NameEquals is null ? SyntaxHelpers.NamedMember(declarator, body.Name.Identifier.Text, value) : declarator.WithExpression(value));
+                    }
+                }
+            }
+
+            return;
+        }
         var (helperType, method) = element switch
         {
             "long" => ("LegacyUserIds", "ToUserGuid"),
-            "int" when argument.Contains("Role", StringComparison.Ordinal) => ("LegacyRoleIds", "ToRoleGuid"),
-            "int" when argument.Contains("Tenant", StringComparison.Ordinal) => ("LegacyTenantIds", "ToTenantGuid"),
+            "int" when argument.Contains("Role", StringComparison.OrdinalIgnoreCase) => ("LegacyRoleIds", "ToRoleGuid"),
+            "int" when argument.Contains("Tenant", StringComparison.OrdinalIgnoreCase) => ("LegacyTenantIds", "ToTenantGuid"),
             _ => ((string?)null, (string?)null)
         };
         if (helperType is null || FindType(semantic.Compilation, helperType) is not { } helper) return;
@@ -439,6 +627,9 @@ public sealed partial class BuildFixStep
 
     [System.Text.RegularExpressions.GeneratedRegex(@"(?:Cannot implicitly convert type|cannot convert from|Cannot convert type) '(?<from>[^']+)' to '(?<to>[^']+)'")]
     private static partial System.Text.RegularExpressions.Regex ConversionMessage();
+
+    [System.Text.RegularExpressions.GeneratedRegex(@"no implicit conversion between '(?<a>[^']+)' and '(?<b>[^']+)'")]
+    private static partial System.Text.RegularExpressions.Regex ConditionalMessage();
 
     [System.Text.RegularExpressions.GeneratedRegex(@"Operator '(?<op>[^']+)' cannot be applied to operands of type '(?<a>[^']+)' and '(?<b>[^']+)'")]
     private static partial System.Text.RegularExpressions.Regex OperatorMessage();
