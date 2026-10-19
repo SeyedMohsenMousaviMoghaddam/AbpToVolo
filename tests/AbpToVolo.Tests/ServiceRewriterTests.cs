@@ -327,4 +327,25 @@ public class ServiceRewriterTests : RewriterTestBase
             """, code);
         Assert.Equal(code, Migrate(code).Code); // a second run adds nothing
     }
+
+    [Fact]
+    public void String_join_over_distinct_values_is_joined_in_memory()
+    {
+        const string source = """
+            public class HeadAppService
+            {
+                public object Get(IQueryable<Item> items) => items.GroupBy(x => x.HeadId).Select(g => new
+                {
+                    Names = string.Join(", ", g.Select(y => y.Name).Distinct()),
+                    All = string.Join(", ", g.Select(y => y.Name))
+                });
+            }
+            """;
+
+        var (code, _) = Migrate(source);
+
+        AssertContains("Names = string.Join(\", \", g.Select(y => y.Name).Distinct().AsEnumerable()),", code);
+        AssertContains("All = string.Join(\", \", g.Select(y => y.Name))", code);
+        Assert.Equal(code, Migrate(code).Code); // a second run adds nothing
+    }
 }

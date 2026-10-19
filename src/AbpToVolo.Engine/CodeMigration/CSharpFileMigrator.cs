@@ -29,6 +29,7 @@ public static class CSharpFileMigrator
         c => new LocalizationRewriter(c),
         c => new ExceptionRewriter(c),
         c => new JwtClaimsRewriter(c),
+        c => new StringJoinDistinctRewriter(c),
         c => new AttributeRewriter(c),
         c => new TypeNameRewriter(c),
         c => new UsingsRewriter(c),
