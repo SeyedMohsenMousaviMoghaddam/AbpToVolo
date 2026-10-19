@@ -50,7 +50,7 @@ public sealed class RenameLayersStep : IMigrationStep
             {
                 var newDirectory = Path.Combine(Path.GetDirectoryName(project.Directory)!, newName);
                 DeleteBuildLeftovers(newDirectory);
-                Directory.Move(project.Directory, newDirectory);
+                MoveDirectory(project.Directory, newDirectory);
             }
 
             context.Report.Change(Name, $"{project.Name} → {newName}");
@@ -101,6 +101,24 @@ public sealed class RenameLayersStep : IMigrationStep
     /// An IDE that has the output solution open restores it while the output is replaced and recreates bin/obj of the
     /// renamed projects (e.g. Acme.Domain/obj), which would stop the folder rename: a folder with nothing else is removed.
     /// </summary>
+    /// <summary>An IDE that indexes the output can hold a folder for a moment ("Access to the path is denied"): retried briefly.</summary>
+    private static void MoveDirectory(string from, string to)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                Directory.Move(from, to);
+                return;
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException && attempt < 10)
+            {
+                Thread.Sleep(500);
+                DeleteBuildLeftovers(to);
+            }
+        }
+    }
+
     internal static void DeleteBuildLeftovers(string directory)
     {
         if (Directory.Exists(directory) &&
