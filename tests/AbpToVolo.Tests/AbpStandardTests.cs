@@ -72,6 +72,9 @@ public sealed class AbpStandardTests : IDisposable
         var migrations = Path_("src/Acme.PhoneBook.EntityFrameworkCore/Migrations");
         var rename = Directory.EnumerateFiles(migrations, "*_RenameModuleZeroTables.cs").Single();
         Assert.Contains("(N'AbpUsers', N'Zero_AbpUsers')", File.ReadAllText(rename));
+        // views that fail as they were are retried against the ABP.io tables (settings, int tenant ids, source user ids)
+        Assert.Contains("CREATE OR ALTER FUNCTION dbo.Zero_ViewCompatSql", File.ReadAllText(rename));
+        Assert.Contains("dbo.Zero_ViewCompatSql(@sql, 1)", File.ReadAllText(rename));
         Assert.Single(Directory.EnumerateFiles(migrations, "*_RenameModuleZeroTables.Designer.cs"));
         Assert.Contains("Zero_IdMap", Read("src/Acme.PhoneBook.EntityFrameworkCore/ModuleZeroDataMigration.sql"));
     }

@@ -187,16 +187,77 @@ internal static class ZeroDatabase
 
     /// <summary>
     /// Recreates the saved views with the ABP.io audit column names; views that use other views are retried until no
-    /// more can be created. A view that still fails (e.g. it uses a Boilerplate column that has no ABP.io equivalent)
+    /// more can be created. A view that fails as it is is retried rewritten by Zero_ViewCompatSql: AbpSettings read
+    /// through dbo.Zero_BoilerplateSettings (TenantId/UserId columns), int tenant literals (TenantId = 1) mapped with
+    /// Zero_IdMap, then source user ids joined on AbpUsers.LegacyId. A view that still fails
+    /// (e.g. it uses a Boilerplate column that has no ABP.io equivalent)
     /// does not stop the migration: its error is kept in dbo.Zero_ViewDefinitions (Recreated = 0) to be fixed by hand.
     /// </summary>
+    internal const string ViewCompatFunctionSql = """
+        CREATE OR ALTER FUNCTION dbo.Zero_ViewCompatSql(@sql nvarchar(max), @mode int)
+        RETURNS nvarchar(max)
+        AS
+        BEGIN
+            -- AbpToVolo: rewrites a Boilerplate view definition for the ABP.io tables; Zero_RecreateViews tries it only
+            -- after the definition itself failed.
+            DECLARE @at int, @end int, @pos int, @hit int, @alias sysname;
+            IF @mode = 0
+            BEGIN
+                -- AbpSettings (TenantId/UserId columns) → the ABP.io settings with those columns
+                SET @sql = REPLACE(REPLACE(REPLACE(@sql, N'[dbo].[AbpSettings]', N'dbo.Zero_BoilerplateSettings'),
+                    N'dbo.AbpSettings', N'dbo.Zero_BoilerplateSettings'), N' AbpSettings', N' dbo.Zero_BoilerplateSettings');
+                -- TenantId = 1 (an int tenant id) → the Guid id of that tenant
+                SET @sql = REPLACE(@sql, N'TenantId=', N'TenantId = ');
+                SET @at = PATINDEX(N'%TenantId = [0-9]%', @sql);
+                WHILE @at > 0
+                BEGIN
+                    SET @at += 11;
+                    SET @end = PATINDEX(N'%[^0-9]%', SUBSTRING(@sql, @at, 30) + N' ');
+                    SET @sql = STUFF(@sql, @at, @end - 1,
+                        N'(SELECT NewId FROM dbo.Zero_IdMap WHERE EntityType = N''Tenant'' AND OldId = ' + SUBSTRING(@sql, @at, @end - 1) + N')');
+                    SET @at = PATINDEX(N'%TenantId = [0-9]%', @sql);
+                END
+            END
+            ELSE
+            BEGIN
+                -- x.SomeUserId = u.Id with SomeUserId still holding the source id → u.LegacyId
+                SET @pos = 1;
+                WHILE 1 = 1
+                BEGIN
+                    SET @hit = PATINDEX(N'%AbpUsers [A-Za-z_]%', SUBSTRING(@sql, @pos, LEN(@sql)));
+                    IF @hit = 0 BREAK;
+                    SET @at = @pos + @hit + 8;
+                    IF SUBSTRING(@sql, @at, 3) = N'AS ' SET @at += 3;
+                    SET @end = PATINDEX(N'%[^A-Za-z0-9_]%', SUBSTRING(@sql, @at, 200) + N' ');
+                    SET @alias = SUBSTRING(@sql, @at, @end - 1);
+                    IF @alias NOT IN (N'ON', N'WITH', N'WHERE', N'JOIN', N'LEFT', N'INNER', N'GROUP', N'ORDER')
+                        SET @sql = REPLACE(REPLACE(@sql, N'UserId = ' + @alias + N'.Id', N'UserId = ' + @alias + N'.LegacyId'),
+                            N'UserId=' + @alias + N'.Id', N'UserId=' + @alias + N'.LegacyId');
+                    SET @pos = @at + 1;
+                END
+            END
+            RETURN @sql;
+        END
+        """;
+
     internal const string RecreateViewsProcedureSql = """
         CREATE OR ALTER PROCEDURE dbo.Zero_RecreateViews
         AS
         BEGIN
             SET NOCOUNT ON;
             SET XACT_ABORT OFF;
-            DECLARE @progress bit = 1, @schema sysname, @name sysname, @definition nvarchar(max);
+            DECLARE @progress bit = 1, @schema sysname, @name sysname, @definition nvarchar(max), @sql nvarchar(max),
+                @attempt int, @done bit, @error nvarchar(4000);
+            IF COL_LENGTH(N'dbo.AbpSettings', N'ProviderName') IS NOT NULL
+                EXEC sp_executesql N'CREATE OR ALTER VIEW dbo.Zero_BoilerplateSettings
+            AS
+            -- AbpToVolo: the ABP.io settings with the Boilerplate AbpSettings columns, for views written against them.
+            SELECT s.Id, s.Name, s.Value,
+                CASE s.ProviderName WHEN N''T'' THEN TRY_CAST(s.ProviderKey AS uniqueidentifier) WHEN N''U'' THEN u.TenantId END AS TenantId,
+                u.Id AS UserId
+            FROM dbo.AbpSettings s
+            LEFT JOIN dbo.AbpUsers u ON s.ProviderName = N''U'' AND u.Id = TRY_CAST(s.ProviderKey AS uniqueidentifier)
+            WHERE s.ProviderName IN (N''G'', N''T'', N''U'')';
             WHILE @progress = 1
             BEGIN
                 SET @progress = 0;
@@ -207,14 +268,23 @@ internal static class ZeroDatabase
                 WHILE @@FETCH_STATUS = 0
                 BEGIN
                     SET @definition = REPLACE(REPLACE(REPLACE(@definition, N'CreatorUserId', N'CreatorId'), N'LastModifierUserId', N'LastModifierId'), N'DeleterUserId', N'DeleterId');
-                    BEGIN TRY
-                        IF OBJECT_ID(QUOTENAME(@schema) + N'.' + QUOTENAME(@name), N'V') IS NULL EXEC sp_executesql @definition;
-                        UPDATE dbo.Zero_ViewDefinitions SET Recreated = 1, Error = NULL WHERE SchemaName = @schema AND ViewName = @name;
-                        SET @progress = 1;
-                    END TRY
-                    BEGIN CATCH
-                        UPDATE dbo.Zero_ViewDefinitions SET Error = ERROR_MESSAGE() WHERE SchemaName = @schema AND ViewName = @name;
-                    END CATCH
+                    SELECT @attempt = 0, @done = 0, @error = NULL;
+                    WHILE @done = 0 AND @attempt <= 2
+                    BEGIN
+                        SET @sql = @definition;
+                        IF @attempt >= 1 SET @sql = dbo.Zero_ViewCompatSql(@sql, 0);
+                        IF @attempt >= 2 SET @sql = dbo.Zero_ViewCompatSql(@sql, 1);
+                        BEGIN TRY
+                            IF OBJECT_ID(QUOTENAME(@schema) + N'.' + QUOTENAME(@name), N'V') IS NULL EXEC sp_executesql @sql;
+                            UPDATE dbo.Zero_ViewDefinitions SET Recreated = 1, Error = NULL WHERE SchemaName = @schema AND ViewName = @name;
+                            SELECT @progress = 1, @done = 1;
+                        END TRY
+                        BEGIN CATCH
+                            IF @attempt = 0 SET @error = ERROR_MESSAGE();
+                            SET @attempt += 1;
+                        END CATCH
+                    END
+                    IF @done = 0 UPDATE dbo.Zero_ViewDefinitions SET Error = @error WHERE SchemaName = @schema AND ViewName = @name;
                     FETCH NEXT FROM views INTO @schema, @name, @definition;
                 END
                 CLOSE views;
@@ -252,6 +322,7 @@ internal static class ZeroDatabase
                         // definitions are saved and they are dropped; AbpIoModules recreates them (EXEC dbo.Zero_RecreateViews).
                         migrationBuilder.Sql(@"{{SaveViewsSql.Replace("\"", "\"\"")}}");
 
+                        migrationBuilder.Sql(@"{{ViewCompatFunctionSql.Replace("\"", "\"\"")}}");
                         migrationBuilder.Sql(@"{{RecreateViewsProcedureSql.Replace("\"", "\"\"")}}");
 
                         migrationBuilder.Sql(@"{{up.Replace("\"", "\"\"")}}");
