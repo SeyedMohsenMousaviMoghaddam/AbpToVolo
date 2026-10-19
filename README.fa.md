@@ -31,13 +31,13 @@
 | `--no-contracts` / `--no-tests` | پروژه‌های Contract / تست ساخته نشوند |
 | `--migrations squash\|delete\|keep` | ادغام migrationها با حفظ تاریخچه (پیش‌فرض)، حذف، یا بدون تغییر |
 | `--no-compiler-fixes` | خروجی build و اصلاح خودکار نشود |
-| `--stub-unresolved` | خطاهایی که اصلاح خودکار ندارند: بدنه اصلی عضو زیر `#if ABPTOVOLO_ORIGINAL` نگه داشته می‌شود و `NotImplementedException` پرتاب می‌کند تا کل solution کامپایل شود (هر مورد در گزارش) |
+| `--no-stub` | پیش‌فرض (`--stub-unresolved`): خطاهایی که اصلاح خودکار ندارند: بدنه اصلی عضو زیر `#if ABPTOVOLO_ORIGINAL` نگه داشته می‌شود و `NotImplementedException` پرتاب می‌کند تا کل solution کامپایل شود (هر مورد در گزارش). با `--no-stub` به‌صورت خطای کامپایل باقی می‌مانند |
 | `--id-type source\|guid` | نوع کلید ارجاع‌های خود برنامه به کاربر/نقش (`UserId`، `RoleId`…). `source` (پیش‌فرض) نوع مبدا (long/int) را نگه می‌دارد و از طریق `LegacyId` به Entityهای ABP.io وصل می‌شود؛ `guid` آن‌ها را به Guid تبدیل می‌کند. فیلدهای ماژول‌های ABP.io (`TenantId`، `CreatorId`…) در هر دو حالت Guid هستند |
 | `--connection-string <cs>` | `ConnectionStrings:Default` برای Host و DbMigrator تبدیل‌شده (یا متغیر محیطی `ABPTOVOLO_CONNECTION_STRING`؛ در تنظیمات ذخیره نمی‌شود) |
 | `--migrate-database` | بعد از تبدیل، DbMigrator را اجرا می‌کند (**دیتابیس را تغییر می‌دهد؛ روی کپی اجرا کنید**) |
 | `--verify-host` | Host تبدیل‌شده را اجرا می‌کند، بالا آمدن Swagger را بررسی می‌کند، endpointهایش را با مبدا مقایسه می‌کند و آن را می‌بندد؛ نتیجه در گزارش می‌آید |
 | `--api-style boilerplate\|abp` | `boilerplate` (پیش‌فرض): Host تبدیل‌شده همان API مبدا را دارد (مسیرهای `/api/services/app/{Service}/{Action}` و پوشش `AjaxResponse`) تا فرانت بدون تغییر کار کند؛ `abp`: قراردادهای ABP.io (`/api/app/{service}` و پاسخ بدون پوشش) |
-| `--build`، `--force`، `--verbose` | build نهایی و درج خطاها در گزارش، جایگزینی خروجی، لاگ کامل |
+| `--no-build`، `--force`، `--verbose` | بدون build نهایی (پیش‌فرض: build نهایی و درج خطاها در گزارش)، جایگزینی خروجی (`.git` و `.abptovolo` حفظ می‌شوند)، لاگ کامل |
 
 خروجی: solution تبدیل‌شده + `ABP-MIGRATION-REPORT.md` (چک‌لیست کارهای دستی با شماره خط) + `abp-migration-report.json` + `abp-migration.log` (لاگ کامل همه مراحل).
 

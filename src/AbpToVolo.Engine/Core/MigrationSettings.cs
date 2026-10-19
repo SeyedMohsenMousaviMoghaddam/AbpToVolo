@@ -33,8 +33,12 @@ public sealed class MigrationSettings
     public IdTypeMode IdType { get; set; } = IdTypeMode.Source;
     public ApiStyleMode ApiStyle { get; set; } = ApiStyleMode.Boilerplate;
     public bool CompilerFixes { get; set; } = true;
-    public bool StubUnresolved { get; set; }
-    public bool Build { get; set; }
+
+    /// <summary>On by default: members that still do not compile keep their code under #if, so the solution builds and runs.</summary>
+    public bool StubUnresolved { get; set; } = true;
+
+    /// <summary>On by default: a final build lists the remaining errors in the report.</summary>
+    public bool Build { get; set; } = true;
 
     /// <summary>Not saved with the settings (it usually contains a password).</summary>
     [JsonIgnore]

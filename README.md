@@ -31,13 +31,13 @@ The Windows app sets the source and destination folders, the ABP version, target
 | `--no-contracts` / `--no-tests` | Do not create the contract projects / the test projects |
 | `--migrations squash\|delete\|keep` | Squash the EF Core migrations keeping the history (default), delete them, or keep them as they are |
 | `--no-compiler-fixes` | Do not build the output and fix compiler errors |
-| `--stub-unresolved` | Members that still do not compile keep their converted body under `#if ABPTOVOLO_ORIGINAL` and throw `NotImplementedException`, so the whole solution compiles (each one is listed in the report) |
+| `--no-stub` | Default (`--stub-unresolved`): members that still do not compile keep their converted body under `#if ABPTOVOLO_ORIGINAL` and throw `NotImplementedException`, so the whole solution compiles (each one is listed in the report); with `--no-stub` they stay as compiler errors |
 | `--id-type source\|guid` | Key type of the application's references to users/roles (`UserId`, `RoleId`…): `source` (default) keeps the source type (long/int), linked to the ABP.io entities through `LegacyId`; `guid` converts them to Guid. ABP.io module fields (`TenantId`, `CreatorId`…) are Guid in both |
 | `--api-style boilerplate\|abp` | `boilerplate` (default): the converted host keeps the HTTP API of the source — `/api/services/app/{Service}/{Action}` routes and the `AjaxResponse` envelope — so the existing front end works unchanged; `abp`: ABP.io conventions (`/api/app/{service}`, results not wrapped) |
 | `--connection-string <cs>` | `ConnectionStrings:Default` of the converted host and DbMigrator (or `ABPTOVOLO_CONNECTION_STRING`; never saved with the settings) |
 | `--migrate-database` | Run the converted DbMigrator after the conversion (**changes that database — use a copy**) |
 | `--verify-host` | Start the converted host, check that Swagger answers (`/swagger/v1/swagger.json`, `/swagger/index.html`), compare its endpoints with the source's, stop it; the result is in the report |
-| `--build`, `--force`, `--verbose` | Final build with the errors in the report, replace a non-empty output, full log |
+| `--no-build`, `--force`, `--verbose` | No final build (default: a final build with the errors in the report), replace a non-empty output (keeps `.git` and `.abptovolo`), full log |
 
 Output: the converted solution, `ABP-MIGRATION-REPORT.md` (checklist of the manual work, with lines), `abp-migration-report.json` and `abp-migration.log` (full log of every step).
 

@@ -30,9 +30,10 @@ public static class Program
           --no-contracts             Do not create *.Domain.Shared / *.Application.Contracts
           --no-tests                 Do not generate the ABP.io test projects
           --no-compiler-fixes        Do not build the result to fix errors from the compiler diagnostics (default: on)
-          --stub-unresolved          Errors the fixes cannot solve: keep the original body under #if ABPTOVOLO_ORIGINAL and
-                                     throw NotImplementedException, so the solution builds (each one is listed in the report)
-          --build                    Run 'dotnet build' on the result and add the remaining errors to the report
+          --no-stub                  Errors the fixes cannot solve stay as compiler errors (default: their original body is kept
+                                     under #if ABPTOVOLO_ORIGINAL and throws NotImplementedException, so the solution builds;
+                                     each one is listed in the report)
+          --no-build                 Do not run the final 'dotnet build' (default: on, remaining errors go to the report)
           --id-type <type>           source (default): the application's user/role/organization unit references keep the
                                      source key type (long/int), linked to the ABP.io entities through LegacyId;
                                      guid: convert them to Guid. TenantId and the audit fields are Guid in both (ABP.io standard)
@@ -170,8 +171,10 @@ public static class Program
                 case "--no-contracts": settings.CreateContracts = false; break;
                 case "--no-tests": settings.CreateTests = false; break;
                 case "--build": settings.Build = true; break;
+                case "--no-build": settings.Build = false; break;
                 case "--no-compiler-fixes": settings.CompilerFixes = false; break;
                 case "--stub-unresolved": settings.StubUnresolved = true; break;
+                case "--no-stub": settings.StubUnresolved = false; break;
                 case "--connection-string": settings.ConnectionString = Value(); break;
                 case "--id-type":
                     var idType = Value();
