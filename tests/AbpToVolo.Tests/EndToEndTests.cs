@@ -88,7 +88,7 @@ public sealed class EndToEndTests : IDisposable
 
         var core = Read("src/Acme.PhoneBook.Core/Acme.PhoneBook.Core.csproj");
         Assert.Contains("<PackageReference Include=\"Volo.Abp.Ddd.Domain\" Version=\"10.7.0\" />", core);
-        Assert.Contains("..\\Acme.PhoneBook.Domain.Shared\\Acme.PhoneBook.Domain.Shared.csproj", core);
+        Assert.Contains("../Acme.PhoneBook.Domain.Shared/Acme.PhoneBook.Domain.Shared.csproj", core.Replace('\\', '/'));
 
         var shared = Read("src/Acme.PhoneBook.Domain.Shared/Acme.PhoneBook.Domain.Shared.csproj");
         Assert.Contains("<PackageReference Include=\"Volo.Abp.Ddd.Domain.Shared\" Version=\"10.7.0\" />", shared);

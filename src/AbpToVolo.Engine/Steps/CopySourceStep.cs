@@ -5,24 +5,28 @@ namespace AbpToVolo.Steps;
 /// <summary>Copies the Boilerplate solution to the output folder. The input folder is never modified.</summary>
 public sealed class CopySourceStep : IMigrationStep
 {
-    public string Name => "Copy source";
+    internal const string StepName = "Copy source";
+    public string Name => StepName;
 
     public void Execute(MigrationContext context)
     {
-        var input = Path.GetFullPath(context.Options.InputPath);
-        var output = Path.GetFullPath(context.Options.OutputPath);
+        var input = ResolveDirectoryPath(context.Options.InputPath);
+        var output = ResolveDirectoryPath(context.Options.OutputPath);
 
         if (!Directory.Exists(input))
         {
             throw new MigrationException($"Input folder not found: {input}");
         }
 
-        if (output.StartsWith(input + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(input, output, StringComparison.OrdinalIgnoreCase))
+        if (ContainsPath(input, output) || ContainsPath(output, input))
         {
-            throw new MigrationException("The output folder must not be the input folder or inside it.");
+            throw new MigrationException("The input and output folders must not be equal or contain one another.");
         }
 
+        // Validate before --force removes anything. Links could lead back into the output
+        // or create a recursive copy; do not silently follow or omit source files.
+        ValidateSource(input, context.CancellationToken);
+        context.CancellationToken.ThrowIfCancellationRequested();
         context.State = MigrationState.Load(output);
         if (Directory.Exists(output) && Directory.EnumerateFileSystemEntries(output).Any(e => !KeptFolders.Contains(Path.GetFileName(e))))
         {
@@ -34,7 +38,7 @@ public sealed class CopySourceStep : IMigrationStep
             ClearOutput(output);
         }
 
-        var count = CopyDirectory(input, output);
+        var count = CopyDirectory(input, output, context.CancellationToken);
         context.Report.Info(Name, $"Copied {count} files from {input}");
 
         var previous = context.State.SourceRevision;
@@ -43,6 +47,41 @@ public sealed class CopySourceStep : IMigrationStep
         {
             context.Report.Info(Name, $"Re-conversion into an existing output (state of {MigrationState.Folder}/{MigrationState.FileName} kept" +
                                       (previous is not null ? $", previous source revision {previous}" : "") + ")");
+        }
+    }
+
+    private static bool ContainsPath(string parent, string child)
+    {
+        var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        return string.Equals(parent, child, comparison) ||
+               child.StartsWith(Path.EndsInDirectorySeparator(parent) ? parent : parent + Path.DirectorySeparatorChar, comparison);
+    }
+
+    private static string ResolveDirectoryPath(string path)
+    {
+        var full = Path.GetFullPath(path);
+        var resolved = Path.GetPathRoot(full)!;
+        foreach (var part in full[resolved.Length..].Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries))
+        {
+            resolved = Path.Combine(resolved, part);
+            var directory = new DirectoryInfo(resolved);
+            if (directory.LinkTarget is not null)
+                resolved = directory.ResolveLinkTarget(returnFinalTarget: true)?.FullName
+                           ?? throw new MigrationException($"Cannot resolve directory link: {resolved}");
+        }
+
+        return Path.TrimEndingDirectorySeparator(resolved);
+    }
+
+    private static void ValidateSource(string directory, CancellationToken cancellationToken)
+    {
+        foreach (var entry in new DirectoryInfo(directory).EnumerateFileSystemInfos())
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (entry is DirectoryInfo && FileSystem.IsIgnoredDirectory(entry.Name)) continue;
+            if ((entry.Attributes & FileAttributes.ReparsePoint) != 0)
+                throw new MigrationException($"Source contains a symbolic link or reparse point: {entry.FullName}. Use a source copy with regular files and directories.");
+            if (entry is DirectoryInfo) ValidateSource(entry.FullName, cancellationToken);
         }
     }
 
@@ -98,22 +137,24 @@ public sealed class CopySourceStep : IMigrationStep
         }
     }
 
-    private static int CopyDirectory(string source, string target)
+    private static int CopyDirectory(string source, string target, CancellationToken cancellationToken)
     {
         Directory.CreateDirectory(target);
         var count = 0;
         foreach (var file in Directory.EnumerateFiles(source))
         {
+            cancellationToken.ThrowIfCancellationRequested();
             File.Copy(file, Path.Combine(target, Path.GetFileName(file)));
             count++;
         }
 
         foreach (var dir in Directory.EnumerateDirectories(source))
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var name = Path.GetFileName(dir);
             if (!FileSystem.IsIgnoredDirectory(name))
             {
-                count += CopyDirectory(dir, Path.Combine(target, name));
+                count += CopyDirectory(dir, Path.Combine(target, name), cancellationToken);
             }
         }
 

@@ -14,6 +14,7 @@ public sealed class FileLogObserver : IMigrationObserver, IDisposable
     private readonly Lock _lock = new();
     private StreamWriter? _writer;
     private string? _outputPath;
+    private bool _outputReady;
 
     public string? LogFilePath { get; private set; }
 
@@ -32,6 +33,7 @@ public sealed class FileLogObserver : IMigrationObserver, IDisposable
 
     public void StepCompleted(StepInfo step, StepSummary summary)
     {
+        if (step.Name == AbpToVolo.Steps.CopySourceStep.StepName) _outputReady = true;
         Write("STEP", $"{step.Position} {step.Name} completed in {summary.Duration.TotalSeconds:0.0}s " +
                       $"({summary.Changes} changes, {summary.Todos} manual items, {summary.Warnings} warnings)");
         OpenIfPossible();
@@ -90,7 +92,7 @@ public sealed class FileLogObserver : IMigrationObserver, IDisposable
         lock (_lock)
         {
             if (_writer is not null) return;
-            var folder = _outputPath is not null && Directory.Exists(_outputPath) ? _outputPath : fallbackToTemp ? Path.GetTempPath() : null;
+            var folder = _outputReady && _outputPath is not null && Directory.Exists(_outputPath) ? _outputPath : fallbackToTemp ? Path.GetTempPath() : null;
             if (folder is null) return;
 
             LogFilePath = Path.Combine(folder, FileName);
