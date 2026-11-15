@@ -106,7 +106,7 @@ public sealed class MigrationEngine
                 report.Count(ReportLevel.Warning) - warnings));
         }
 
-        observer.RunCompleted(report, total.Elapsed, success: true);
+        observer.RunCompleted(report, total.Elapsed, success: report.BuildErrorCount is not > 0);
         report.EntryAdded -= observer.Entry;
         return report;
     }

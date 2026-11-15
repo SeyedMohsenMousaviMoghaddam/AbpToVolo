@@ -97,10 +97,10 @@ public static class Program
         var options = settings.ToOptions();
         try
         {
-            new MigrationEngine().Run(options, observer, cancellation.Token);
+            var report = new MigrationEngine().Run(options, observer, cancellation.Token);
             Console.WriteLine($"Report: {Path.Combine(options.OutputPath, ReportWriterStep.MarkdownFile)}");
             Console.WriteLine($"Log:    {fileLog.LogFilePath}");
-            return 0;
+            return report.BuildErrorCount is > 0 ? 1 : 0;
         }
         catch (OperationCanceledException)
         {

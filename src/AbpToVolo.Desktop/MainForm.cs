@@ -438,7 +438,10 @@ public sealed class MainForm : Form
             var todos = report.Entries.Count(e => e.Level is ReportLevel.Todo or ReportLevel.Warning);
             var build = report.BuildErrorCount is { } count ? (count == 0 ? T("BuildClean") : T("BuildErrors", count)) : "";
             SetStatus(T("Finished", report.CSharpFilesChanged, report.ProjectsMigrated, todos, build));
-            MessageBox.Show(this, T("Succeeded", Environment.NewLine, _status.Text ?? "", _reportPath ?? ""), Text, MessageBoxButtons.OK, MessageBoxIcon.Information,
+            MessageBox.Show(this, report.BuildErrorCount is > 0
+                ? T("BuildErrors", report.BuildErrorCount.Value) + Environment.NewLine + _reportPath
+                : T("Succeeded", Environment.NewLine, _status.Text ?? "", _reportPath ?? ""), Text, MessageBoxButtons.OK,
+                report.BuildErrorCount is > 0 ? MessageBoxIcon.Warning : MessageBoxIcon.Information,
                 MessageBoxDefaultButton.Button1, MessageOptions());
         }
         catch (OperationCanceledException)

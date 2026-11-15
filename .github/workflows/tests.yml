@@ -1,0 +1,26 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - run: dotnet test tests/AbpToVolo.Tests/AbpToVolo.Tests.csproj --configuration Release --nologo
+      - if: runner.os == 'Windows'
+        run: dotnet build src/AbpToVolo.Desktop/AbpToVolo.Desktop.csproj --configuration Release --nologo
